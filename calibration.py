@@ -664,13 +664,22 @@ def collect_stats(model_patcher,
         for name, mu2_sum in mu2_store.items():
             n = count_store.get(name, 1)
             mu2 = mu2_sum / n
-            # mu2 was collected on (potentially padded) activations.
-            # Crop the permutation to the original in_features so it
-            # matches the Hessian after rotation-padding is cropped.
-            in_f = shapes[name][1]
+            # mu2 was accumulated after rotation (PermuQuant-H).
+            # Compute correct in_f for Conv2d (flattened features).
+            shape = shapes[name]
+            ltype = layer_types[name]
+            if ltype == "Conv2d":
+                in_f = shape[1] * shape[2] * shape[3]
+            else:
+                in_f = shape[1]
+            # Crop mu2 to in_f BEFORE sorting so permutation indices stay
+            # in [0, in_f-1].  This is required because the converter
+            # validates perm.max() < in_f.  Without the crop, indices from
+            # the rotated-padded space (up to alloc_f-1) would fail the
+            # check and the converter would skip the permutation entirely,
+            # leaving the weight unpermuted while the Hessian is permuted.
+            mu2 = mu2[:in_f]
             perm = mu2.argsort(descending=True).to(torch.int32)
-            if perm.shape[0] > in_f:
-                perm = perm[:in_f]
             permutations[name] = perm
         logger.info("PermuQuant: computed permutations for %d layers", len(permutations))
 

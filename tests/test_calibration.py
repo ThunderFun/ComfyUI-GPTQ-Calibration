@@ -945,3 +945,86 @@ class TestCollectorModeBoth:
         assert H.shape == (256, 256)
         assert torch.all(torch.isfinite(H))
 
+
+class TestPermuQuantConv2dBug3:
+    """Regression tests for Bug 3: Conv2d feature count + permutation cropping."""
+
+    def test_conv2d_in_features_computed_from_flattened_shape(self, calibration_mod):
+        """For Conv2d, in_features should be in_channels * kH * kW, not just in_channels."""
+        torch.manual_seed(0)
+        conv = nn.Conv2d(1, 4, kernel_size=3, padding=1, bias=False)
+        x = torch.randn(1, 1, 8, 8)
+
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "conv_bug3", store, "Conv2d", mode="mu2"
+        )
+        collector.register(conv)
+        _ = conv(x)
+        collector.remove()
+
+        mu2 = store["mu2"]["conv_bug3"]
+        # Flattened input features = 1 * 3 * 3 = 9
+        assert mu2.shape == (9,), (
+            f"Expected mu2 shape (9,) for Conv2d(1,4,3x3), got {mu2.shape}"
+        )
+
+    def test_permutation_in_rotated_space(self, calibration_mod):
+        """Permutation is computed in rotated space (PermuQuant-H).
+
+        mu2 is accumulated after rotation, so permutation indices correspond
+        to rotated channels.  For layers without padding (in_f divisible by
+        rot_size), indices stay in [0, in_f-1].  For layers with padding,
+        indices can reach alloc_f — the converter handles this via its
+        validation check.
+        """
+        torch.manual_seed(0)
+        # 256 features, no padding (256 % 256 == 0)
+        lin = nn.Linear(256, 4, bias=False)
+        x = torch.randn(2, 256)
+
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "perm_rot", store, "Linear", mode="mu2", rot_size=256
+        )
+        collector.register(lin)
+        _ = lin(x)
+        collector.remove()
+
+        mu2 = store["mu2"]["perm_rot"]
+        # No padding: mu2 has 256 entries (same as in_f)
+        assert mu2.shape == (256,), f"Expected mu2 shape (256,), got {mu2.shape}"
+
+        perm = mu2.argsort(descending=True)
+        assert perm.shape[0] == 256
+        # All indices valid for 256-feature layer
+        assert perm.max() < 256
+        assert perm.min() >= 0
+
+    def test_permuquant_with_rotation_produces_valid_hessian(self, calibration_mod):
+        """End-to-end: mode='both' + rot_size + permuquant should produce valid Hessian."""
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 4, bias=False)
+        x = torch.randn(2, 256)
+
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "e2e", store, "Linear", mode="both", rot_size=256
+        )
+        collector.register(lin)
+        _ = lin(x)
+        collector.remove()
+
+        assert "mu2" in store
+        assert "hessians" in store
+        H = store["hessians"]["e2e"]
+        assert H.shape == (256, 256)
+        assert torch.all(torch.isfinite(H))
+
+        mu2 = store["mu2"]["e2e"]
+        assert mu2.shape == (256,)
+
+        perm = mu2.argsort(descending=True).to(torch.int32)
+        assert perm.shape[0] == 256
+        assert perm.max() < 256
+
