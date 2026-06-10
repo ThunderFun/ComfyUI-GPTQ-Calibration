@@ -947,7 +947,6 @@ class TestCollectorModeBoth:
 
 
 class TestPermuQuantConv2dBug3:
-    """Regression tests for Bug 3: Conv2d feature count + permutation cropping."""
 
     def test_conv2d_in_features_computed_from_flattened_shape(self, calibration_mod):
         """For Conv2d, in_features should be in_channels * kH * kW, not just in_channels."""

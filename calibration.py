@@ -22,26 +22,50 @@ logger = logging.getLogger("comfyui_gptq_calibration")
 
 # ── ConvRot Hadamard rotation ──
 
-_HADAMARD_CACHE: Dict[int, torch.Tensor] = {}
+_HADAMARD_CACHE: Dict[tuple, torch.Tensor] = {}
+
+def _is_power_of_four(n: int) -> bool:
+    """Return True if n is a power of 4 (4, 16, 64, 256, ...)."""
+    if n < 4:
+        return False
+    return (n & (n - 1)) == 0 and (n & 0x55555555) == n
 
 def get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     """Return a normalized Hadamard matrix of the given size.
 
+    Uses Regular Hadamard for powers of 4 (ConvRot paper: balanced row
+    sums prevent row-wise outlier aggregation). Falls back to Sylvester
+    construction for other powers of 2.
+
     The matrix is cached after first construction. ``size`` must be a
     power of 2.
     """
-    if size in _HADAMARD_CACHE:
-        return _HADAMARD_CACHE[size]
+    key = (size, str(dtype), device)
+    if key in _HADAMARD_CACHE:
+        return _HADAMARD_CACHE[key]
     if not ((size & (size - 1)) == 0 and size > 0):
         raise ValueError(f"Hadamard size must be a power of 2, got {size}")
-    H = torch.tensor([[1.0]], dtype=dtype, device=device)
-    while H.shape[0] < size:
-        H = torch.kron(
-            torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=dtype, device=device),
-            H,
-        )
-    H = H * (1.0 / math.sqrt(size))
-    _HADAMARD_CACHE[size] = H
+
+    if _is_power_of_four(size):
+        H4 = torch.tensor([
+            [ 1.0,  1.0,  1.0, -1.0],
+            [ 1.0,  1.0, -1.0,  1.0],
+            [ 1.0, -1.0,  1.0,  1.0],
+            [-1.0,  1.0,  1.0,  1.0],
+        ], dtype=dtype, device=device) / 2.0
+        H = H4
+        while H.shape[0] < size:
+            H = torch.kron(H, H4)
+    else:
+        H = torch.tensor([[1.0]], dtype=dtype, device=device)
+        while H.shape[0] < size:
+            H = torch.kron(
+                torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=dtype, device=device),
+                H,
+            )
+        H = H * (1.0 / math.sqrt(size))
+
+    _HADAMARD_CACHE[key] = H
     return H
 
 def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
