@@ -16,12 +16,7 @@ def save_calibration(data: dict, path: str) -> str:
 
 
 def load_calibration(path: str) -> dict:
-    """Load calibration data from a .pt file. Always mapped to CPU.
-
-    Uses ``weights_only=True`` which is sufficient for our payload
-    (tensors, dicts, lists, and primitive scalars produced by
-    ``collect_stats``) and avoids the PyTorch 2.6+ security warning.
-    """
+    """Load calibration data from a .pt file (CPU, weights_only=True)."""
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
@@ -30,19 +25,7 @@ def estimate_disk_size(num_layers: int,
                        hessian_block_size: int = 0,
                        collect_amax: bool = True,
                        dtype_bytes: int = 4) -> dict:
-    """Estimate the output file size in bytes.
-
-    Args:
-        num_layers: Number of layers that will be instrumented.
-        avg_in_features: Average ``in_features`` (or ``C_in*kH*kW`` for conv2d).
-        hessian_block_size: ``0`` for full Hessian, else diagonal blocks.
-        collect_amax: Whether amax scalars are stored.
-        dtype_bytes: Bytes per float (Hessians are accumulated in float32).
-
-    Returns:
-        Dict with ``hessian_bytes``, ``amax_bytes``, ``total_bytes`` and
-        ``total_gb`` keys.
-    """
+    """Estimate output file size. Returns dict with hessian_bytes, amax_bytes, total_bytes, total_gb."""
     if hessian_block_size and hessian_block_size > 0:
         block = hessian_block_size
         num_blocks = max(1, (avg_in_features + block - 1) // block)

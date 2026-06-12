@@ -26,14 +26,7 @@ def _default_output_path() -> str:
 
 
 def _normalize_conditioning(conditioning) -> list:
-    """Validate and return ComfyUI CONDITIONING.
-
-    ComfyUI's CONDITIONING is ``list[list]`` where each inner list is
-    ``[cross_attn_tensor, metadata_dict]``.  We validate the outer
-    structure but must **not** flatten it — the sampler's
-    ``convert_cond`` / ``cond_has_hooks`` iterate over the outer list
-    and index ``c[1]`` on each entry.
-    """
+    """Validate and return ComfyUI CONDITIONING (list of [tensor, dict] entries)."""
     if conditioning is None:
         return []
     if not isinstance(conditioning, list):
@@ -45,11 +38,8 @@ def _normalize_conditioning(conditioning) -> list:
 
 
 class CalibrationDataCollector(ComfyNodeABC):
-    """Collect per-layer activation statistics (Hessians + optional amax)
-    from a loaded diffusion model.
-
-    No quantization is performed; the output is a single ``.pt`` file
-    consumable by external quantizers (e.g. GPTQ/OBQ/ConvRot).
+    """Collect per-layer Hessians and amax from a loaded diffusion model.
+    Output is a ``.pt`` file for external quantizers (GPTQ/OBQ/ConvRot).
     """
 
     DESCRIPTION = (
@@ -79,7 +69,7 @@ class CalibrationDataCollector(ComfyNodeABC):
                 "latent_height": (IO.INT, {"default": 64, "min": 8, "max": 1024, "tooltip": "Latent spatial height. 128 for 1024px, 64 for 512px."}),
                 "latent_width": (IO.INT, {"default": 64, "min": 8, "max": 1024, "tooltip": "Latent spatial width. 128 for 1024px, 64 for 512px."}),
                 "convrot": (IO.BOOLEAN, {"default": False, "tooltip": "Enable ConvRot Hadamard rotation. Collects Hessians in rotated space for better block-diagonal approximation."}),
-                "rot_size": (IO.INT, {"default": 256, "min": 16, "max": 1024, "tooltip": "Hadamard group size (must be power of 2). 256 recommended for ConvRot."}),
+                "rot_size": (IO.INT, {"default": 256, "min": 16, "max": 4096, "tooltip": "Hadamard group size (must be power of 2). 256 recommended for ConvRot."}),
                 "permuquant": (IO.BOOLEAN, {"default": False, "tooltip": "Enable PermuQuant channel reordering. Runs a second calibration pass with channels sorted by second moment for better quantization."}),
             },
         }

@@ -19,6 +19,13 @@ import tempfile
 
 logger = logging.getLogger("comfyui_gptq_calibration")
 
+# Optional: Triton FHT kernel for O(N log N) rotation on GPU.
+# Falls back to the CPU matmul path when Triton/CUDA unavailable.
+try:
+    from kernels.triton_fht_rotate import fht_rotate as _fht_rotate
+except ImportError:
+    _fht_rotate = None
+
 
 # ── ConvRot Hadamard rotation ──
 
@@ -33,12 +40,8 @@ def _is_power_of_four(n: int) -> bool:
 def get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     """Return a normalized Hadamard matrix of the given size.
 
-    Uses Regular Hadamard for powers of 4 (ConvRot paper: balanced row
-    sums prevent row-wise outlier aggregation). Falls back to Sylvester
-    construction for other powers of 2.
-
-    The matrix is cached after first construction. ``size`` must be a
-    power of 2.
+    Uses Regular Hadamard for powers of 4, Sylvester for other powers of 2.
+    Cached after first construction. ``size`` must be a power of 2.
     """
     key = (size, str(dtype), device)
     if key in _HADAMARD_CACHE:
@@ -69,12 +72,7 @@ def get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     return H
 
 def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Apply group-wise Hadamard rotation to activations.
-
-    Pads the last dimension to a multiple of ``rot_size`` if needed,
-    then applies the normalized Hadamard transform independently to
-    each group. Used for ConvRot-style Hessian rotation.
-    """
+    """Apply group-wise Hadamard rotation, padding the last dim to a multiple of ``rot_size``."""
     if not ((rot_size & (rot_size - 1)) == 0 and rot_size > 0):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
     orig_features = x.shape[-1]
@@ -91,20 +89,7 @@ def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 
 
 def permute_hessian(H, perm: torch.Tensor):
-    """Apply a channel permutation to a Hessian matrix (full or block-diagonal).
-
-    For full 2D Hessians: H_perm = H[perm][:, perm].
-    For block-diagonal Hessians: builds each output block directly from
-    the source diagonal blocks without materializing the full n*n matrix.
-    Block-diagonal list format is preserved.
-
-    Args:
-        H: Hessian tensor (2D or 3D) or list of block tensors
-        perm: [in_features] permutation indices (int32 or int64)
-
-    Returns:
-        Permuted Hessian in the same format as the input
-    """
+    """Permute a Hessian matrix (2D tensor, 3D stacked blocks, or list of blocks)."""
     perm = perm.to(torch.int64)
 
     if isinstance(H, list):
@@ -171,24 +156,11 @@ def permute_hessian(H, perm: torch.Tensor):
 
 
 class ActivationStatsCollector:
-    """Forward pre-hook that accumulates activation statistics for one layer.
+    """Forward pre-hook that accumulates Hessian and/or amax stats for one layer.
 
-    For each forward pass the hook flattens the layer's input to 2D
-    (using ``nn.Unfold`` for ``nn.Conv2d``) and adds
-    ``x.T @ x`` to a per-layer Hessian on CPU, and tracks the running
-    maximum of ``abs(x)`` (amax).
-
-    The Hessian can be stored either as the full ``(in_features,
-    in_features)`` matrix (default, paper-accurate) or as a stack of
-    diagonal blocks of size ``hessian_block_size`` to save disk space.
-
-    When ``mode="mu2"``, only per-channel second moments are accumulated
-    (for PermuQuant channel reordering). No Hessian is stored.
-    When ``mode="both"``, both mu2 and Hessian are accumulated in a single
-    pass. The caller can then compute permutations from mu2 and apply them
-    to the collected Hessians after the fact.
-    When ``permutation`` is provided, activations are reindexed before
-    Hessian accumulation.
+    Modes: ``"hessian"`` (default), ``"mu2"`` (second moments for PermuQuant),
+    ``"both"`` (both in one pass). When ``permutation`` is provided, activations
+    are reindexed before accumulation.
     """
 
     def __init__(self,
@@ -318,11 +290,21 @@ class ActivationStatsCollector:
         if x_flat.numel() == 0:
             return
 
-        # Move to CPU before accumulation
-        x_flat = x_flat.cpu().float()
+        # Cast to float32 (stays on input device — typically CUDA)
+        x_flat = x_flat.float()
 
         if self.rot_size > 0:
-            x_flat = rotate_activations(x_flat, self.rot_size)
+            if _fht_rotate is not None:
+                # GPU path: O(N log N) FHT on CUDA, with automatic
+                # CPU fallback when Triton/CUDA unavailable.
+                x_flat = _fht_rotate(x_flat, self.rot_size)
+            else:
+                # CPU fallback: O(N²) matmul with Hadamard matrix.
+                x_flat = x_flat.cpu()
+                x_flat = rotate_activations(x_flat, self.rot_size)
+
+        # Move to CPU for Hessian accumulation
+        x_flat = x_flat.cpu()
 
         if self.mode == "mu2":
             self._accumulate_mu2(x_flat)
@@ -342,11 +324,7 @@ class ActivationStatsCollector:
 
 
 def _walk_target_modules(model: nn.Module) -> List[tuple]:
-    """Yield (qualified_name, module) for every Linear/Conv2d in ``model``.
-
-    The traversal uses ``isinstance`` so that custom subclasses of
-    ``nn.Linear`` and ``nn.Conv2d`` are also picked up.
-    """
+    """Yield (name, module) for every Linear/Conv2d in ``model``."""
     targets = []
     for name, module in model.named_modules():
         if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -397,13 +375,7 @@ def _resolve_inner_model(model_patcher) -> nn.Module:
 
 
 def _infer_latent_shape(model_patcher, height: int = 64, width: int = 64) -> tuple:
-    """Return ``(channels, H, W)`` for the calibration noise tensor.
-
-    The ``height`` and ``width`` arguments are **latent** dimensions
-    (i.e. the spatial size of the latent the model expects). The
-    channel count is taken from the model's ``latent_format`` if
-    available, else defaults to 4.
-    """
+    """Return ``(channels, H, W)`` for the calibration noise tensor."""
     inner = getattr(model_patcher, "model", None)
     if inner is None:
         return (4, int(height), int(width))
@@ -418,13 +390,7 @@ def _resolve_model_sampling(model_patcher):
 
 
 def _build_sigmas(model_sampling, num_steps: int) -> torch.Tensor:
-    """Return a tensor of ``num_steps + 1`` sigmas ending at 0.
-
-    Uses ``simple_scheduler`` if a model_sampling is available (which gives
-    us the proper sigma_min/sigma_max). Otherwise falls back to a linear
-    schedule from 1.0 to 0.0 which is a reasonable approximation for
-    most flow-matching / EDM-style models.
-    """
+    """Return ``num_steps + 1`` sigmas ending at 0, using simple_scheduler if available."""
     if model_sampling is not None:
         try:
             return comfy.samplers.simple_scheduler(model_sampling, num_steps)
@@ -434,10 +400,7 @@ def _build_sigmas(model_sampling, num_steps: int) -> torch.Tensor:
 
 
 def _validate_hessians(hessians: Dict[str, torch.Tensor]) -> None:
-    """Check accumulated Hessians for corruption (extreme outliers, asymmetry).
-
-    Logs warnings for any layers with suspicious entries. Does NOT modify the data.
-    """
+    """Check Hessians for corruption (extreme outliers, asymmetry). Logs warnings only."""
     corrupted = []
     for name, H in hessians.items():
         if not isinstance(H, torch.Tensor):
@@ -562,25 +525,8 @@ def collect_stats(model_patcher,
                   permuquant: bool = False) -> Dict:
     """Run partial denoising and collect per-layer activation statistics.
 
-    Args:
-        model_patcher: A ComfyUI ``ModelPatcher`` instance (already loaded).
-        conditioning: A list of ``CONDITIONING`` dicts. The first batch
-            element is used; duplicates are generated by re-noising.
-        num_steps: Number of denoising steps per sample.
-        num_samples: Number of independent samples to run.
-        seed: Seed for the random noise / timestep generator.
-        latent_height/latent_width: Latent spatial size to use.
-        hessian_block_size: ``0`` for full H (auto memory-mapped to disk),
-            else diagonal block size.
-        collect_amax: Whether to track ``max(abs(x))`` per layer.
-        output_path: Optional path used to place temporary mmap files when
-            ``hessian_block_size == 0``.
-        progress_callback: Optional ``callable(done, total, msg)``.
-
-    Returns:
-        Dict with keys ``metadata``, ``hessians``, ``amax`` (optional),
-        ``shapes`` and ``layer_types``. May also contain
-        ``_mmap_temp_dir`` when full-Hessian mmap is active.
+    Returns a dict with keys: ``metadata``, ``hessians``, ``amax``,
+    ``shapes``, ``layer_types``, and optionally ``permuquant``.
     """
     if model_patcher is None:
         raise ValueError("model_patcher is required")
@@ -696,12 +642,9 @@ def collect_stats(model_patcher,
                 in_f = shape[1] * shape[2] * shape[3]
             else:
                 in_f = shape[1]
-            # Crop mu2 to in_f BEFORE sorting so permutation indices stay
-            # in [0, in_f-1].  This is required because the converter
-            # validates perm.max() < in_f.  Without the crop, indices from
-            # the rotated-padded space (up to alloc_f-1) would fail the
-            # check and the converter would skip the permutation entirely,
-            # leaving the weight unpermuted while the Hessian is permuted.
+            # Crop mu2 to in_f BEFORE sorting so perm indices stay in [0, in_f).
+            # The padded rotation space (alloc_f) would produce out-of-range indices
+            # that the converter rejects, leaving weights unpermuted.
             mu2 = mu2[:in_f]
             perm = mu2.argsort(descending=True).to(torch.int32)
             permutations[name] = perm

@@ -38,7 +38,7 @@ No extra dependencies are required — torch and numpy are already shipped with 
 | `latent_height` | INT | 64 | Latent spatial height (128 for 1024px, 64 for 512px) |
 | `latent_width` | INT | 64 | Latent spatial width (128 for 1024px, 64 for 512px) |
 | `convrot` | BOOLEAN | False | Enable ConvRot Hadamard rotation |
-| `rot_size` | INT | 256 | Hadamard group size (must be power of 2) |
+| `rot_size` | INT | 256 | Hadamard group size (must be power of 2, up to 4096) |
 
 ### Output
 

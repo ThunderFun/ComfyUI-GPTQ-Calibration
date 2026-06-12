@@ -1,10 +1,5 @@
-"""ComfyUI custom node plugin for collecting per-layer activation
-statistics (Hessians and optional amax) for external quantization tools.
-
-The plugin is intentionally **read-only with respect to model weights**:
-no quantization, INT4 packing or safetensors output is produced. The
-single ``.pt`` artifact emitted is meant to be consumed offline by a
-GPTQ/OBQ/ConvRot-style tool.
+"""Collect per-layer activation statistics (Hessians, amax) for external
+quantization tools (GPTQ/OBQ/ConvRot).  Read-only: no weights modified.
 """
 
 try:
