@@ -71,6 +71,7 @@ class CalibrationDataCollector(ComfyNodeABC):
                 "convrot": (IO.BOOLEAN, {"default": False, "tooltip": "Enable ConvRot Hadamard rotation. Collects Hessians in rotated space for better block-diagonal approximation."}),
                 "rot_size": (IO.INT, {"default": 256, "min": 16, "max": 4096, "tooltip": "Hadamard group size (must be power of 2). 256 recommended for ConvRot."}),
                 "permuquant": (IO.BOOLEAN, {"default": False, "tooltip": "Enable PermuQuant channel reordering. Runs a second calibration pass with channels sorted by second moment for better quantization."}),
+                "piso": (IO.BOOLEAN, {"default": False, "tooltip": "Collect Hessian diagonal for PiSO data-aware scale optimization. Adds a small overhead to store diag(X^T X) per layer, which the converter uses to compute optimal per-row scales instead of absmax."}),
             },
         }
 
@@ -87,7 +88,8 @@ class CalibrationDataCollector(ComfyNodeABC):
                 latent_width: int = 64,
                 convrot: bool = False,
                 rot_size: int = 256,
-                permuquant: bool = False) -> tuple:
+                permuquant: bool = False,
+                piso: bool = False) -> tuple:
         cond = _normalize_conditioning(conditioning)
         if not cond:
             raise ValueError("conditioning is empty")
@@ -111,6 +113,7 @@ class CalibrationDataCollector(ComfyNodeABC):
             output_path=output_path,
             progress_callback=_cb,
             permuquant=permuquant,
+            piso=piso,
         )
 
         try:

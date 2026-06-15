@@ -510,6 +510,31 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
     logger.info("Calibration (%s) complete: %d samples in %.1fs", pass_label, total, total_elapsed)
 
 
+def _extract_hessian_diag(H) -> Optional[torch.Tensor]:
+    """Extract the diagonal from a Hessian (full or block-diagonal).
+
+    For block-diagonal Hessians (list of blocks), concatenates the diagonals
+    of each block.  For full Hessians (2D tensor), takes the diagonal directly.
+
+    Returns:
+        [in_features] float32 diagonal, or None if the format is unrecognized.
+    """
+    if isinstance(H, list):
+        parts = []
+        for block in H:
+            if isinstance(block, torch.Tensor) and block.dim() == 2:
+                parts.append(block.diagonal())
+        if not parts:
+            return None
+        return torch.cat(parts).float()
+    if isinstance(H, torch.Tensor):
+        if H.dim() == 2:
+            return H.diagonal().float()
+        if H.dim() == 3:
+            return torch.cat([H[i].diagonal() for i in range(H.shape[0])]).float()
+    return None
+
+
 def collect_stats(model_patcher,
                   conditioning,
                   num_steps: int = 4,
@@ -522,7 +547,8 @@ def collect_stats(model_patcher,
                   rot_size: int = 0,
                   output_path: Optional[str] = None,
                   progress_callback: Optional[Callable[[int, int, str], None]] = None,
-                  permuquant: bool = False) -> Dict:
+                  permuquant: bool = False,
+                  piso: bool = False) -> Dict:
     """Run partial denoising and collect per-layer activation statistics.
 
     Returns a dict with keys: ``metadata``, ``hessians``, ``amax``,
@@ -662,6 +688,16 @@ def collect_stats(model_patcher,
     # Validate Hessians for corruption (extreme outliers, asymmetry)
     _validate_hessians(store.get("hessians", {}))
 
+    # ── PiSO: extract Hessian diagonal for data-aware scale optimization ──
+    hessian_diag_store: Dict[str, torch.Tensor] = {}
+    if piso:
+        hessians = store.get("hessians", {})
+        for name, H in hessians.items():
+            diag = _extract_hessian_diag(H)
+            if diag is not None:
+                hessian_diag_store[name] = diag
+        logger.info("PiSO: extracted Hessian diagonal for %d layers", len(hessian_diag_store))
+
     # Crop rotation padding: when rot_size > 0, Hessians were allocated at the
     # padded feature count.  Crop back to the original in_features so the saved
     # file matches the actual layer dimensions.
@@ -713,6 +749,7 @@ def collect_stats(model_patcher,
         "rot_size": int(rot_size),
         "hessian_rotated": rot_size > 0,
         "permuquant_enabled": permuquant,
+        "piso_enabled": piso and bool(hessian_diag_store),
         "collection_date": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "recommended_damping_ratio": 0.01,
         "quantization_order": "column",
@@ -729,6 +766,8 @@ def collect_stats(model_patcher,
     }
     if permutations:
         result["permuquant"] = permutations
+    if hessian_diag_store:
+        result["hessian_diag"] = hessian_diag_store
     if mmap_dir is not None:
         result["_mmap_temp_dir"] = mmap_dir
     return result
