@@ -1,4 +1,8 @@
-"""Tests for ActivationStatsCollector and related calibration functions."""
+"""Tests for ActivationStatsCollector and related calibration functions.
+
+Sections: basic Hessian/amax, block-diagonal, ConvRot rotation, PermuQuant
+(mu2 + permutations + permute_hessian), mode='both', NaN/Inf/outlier guard.
+"""
 from __future__ import annotations
 
 import torch
@@ -7,10 +11,12 @@ import torch.nn.functional as F
 
 
 def _flatten_linear(x: torch.Tensor) -> torch.Tensor:
+    """Flatten to (rows, in_features) — mirrors ActivationStatsCollector._flatten_linear_input."""
     return x.reshape(-1, x.shape[-1])
 
 
 def _flatten_conv(x: torch.Tensor, module: nn.Conv2d) -> torch.Tensor:
+    """Unfold Conv2d to (patches, in_ch·kH·kW) — mirrors ActivationStatsCollector._flatten_conv_input."""
     patches = F.unfold(
         x,
         module.kernel_size,
@@ -947,6 +953,9 @@ class TestCollectorModeBoth:
 
 
 class TestPermuQuantConv2dBug3:
+    """Regression: PermuQuant was using in_channels instead of in_channels·kH·kW
+    for Conv2d, producing wrong mu2 shapes and out-of-range permutation indices.
+    """
 
     def test_conv2d_in_features_computed_from_flattened_shape(self, calibration_mod):
         """For Conv2d, in_features should be in_channels * kH * kW, not just in_channels."""
@@ -1026,4 +1035,254 @@ class TestPermuQuantConv2dBug3:
         perm = mu2.argsort(descending=True).to(torch.int32)
         assert perm.shape[0] == 256
         assert perm.max() < 256
+
+
+# ── NaN guard tests ─────────────────────────────────────────────────────────
+
+class TestNaNGuard:
+    """Tests for the NaN/Inf guard that prevents corrupted forward passes
+    from permanently poisoning the Hessian blocks.
+
+    When the model runs in bf16/fp16, some timesteps can produce NaN
+    activations.  Previously, ``block.add_(xi.T @ xi)`` with NaN input
+    permanently corrupted the block (NaN + anything = NaN).  Meanwhile,
+    ``_accumulate_amax`` silently hid the NaN because ``NaN > prev`` is
+    False in Python — so the amax stayed finite while the Hessian rotted.
+
+    Now ``_hook_fn`` checks ``torch.isfinite(x_flat).all()`` before
+    any accumulation and skips the forward pass if NaN/Inf is found.
+    """
+
+    def test_nan_input_does_not_corrupt_hessian(self, calibration_mod):
+        """A NaN-contaminated forward pass must not corrupt the Hessian
+        that was already accumulated from clean passes.
+
+        In a real diffusion model the NaN comes from a previous layer's
+        output (in bf16), which becomes the *input* to the next layer's
+        hook.  We simulate this by passing a tensor with NaN directly.
+        """
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "nan_test", store, "Linear", hessian_block_size=128, rot_size=0,
+        )
+        collector.register(lin)
+
+        # Accumulate two clean forward passes
+        x1 = torch.randn(8, 256)
+        x2 = torch.randn(8, 256)
+        _ = lin(x1)
+        _ = lin(x2)
+        H = store["hessians"]["nan_test"]
+        assert torch.all(torch.isfinite(H)), "Clean Hessian should be finite"
+
+        # Pass an input with NaN — simulates a bf16 model producing NaN
+        # activations at a certain timestep, which the pre-hook captures
+        # as the input to this layer.
+        x_nan = torch.randn(8, 256)
+        x_nan[3, 100] = float("nan")
+        _ = lin(x_nan)
+
+        # The Hessian must NOT have been corrupted by the NaN pass
+        assert torch.all(torch.isfinite(H)), (
+            "Hessian was corrupted by NaN forward pass — the NaN guard failed"
+        )
+        # The NaN skip counter should have been incremented
+        assert collector._nan_skip_count > 0, (
+            "NaN skip counter should be > 0 after a NaN-contaminated pass"
+        )
+        collector.remove()
+
+    def test_inf_input_does_not_corrupt_hessian(self, calibration_mod):
+        """Inf in activations should also be skipped."""
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "inf_test", store, "Linear", hessian_block_size=128, rot_size=0,
+        )
+        collector.register(lin)
+
+        # Clean pass
+        _ = lin(torch.randn(8, 256))
+        H = store["hessians"]["inf_test"]
+        assert torch.all(torch.isfinite(H))
+
+        # Pass an input with Inf
+        x_inf = torch.randn(8, 256)
+        x_inf[0, 0] = float("inf")
+        _ = lin(x_inf)
+
+        assert torch.all(torch.isfinite(H)), (
+            "Hessian was corrupted by Inf forward pass"
+        )
+        assert collector._nan_skip_count > 0
+        collector.remove()
+
+    def test_nan_with_rotation(self, calibration_mod):
+        """NaN guard works when ConvRot rotation is enabled.
+
+        The Hadamard rotation spreads one NaN feature across all 256
+        features in its group, making the entire xi.T @ xi block NaN.
+        The guard must catch this BEFORE the rotation to avoid wasted
+        GPU compute, and also after as a defensive check.
+        """
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "nan_rot", store, "Linear", hessian_block_size=0, rot_size=256,
+        )
+        collector.register(lin)
+
+        # Clean passes
+        _ = lin(torch.randn(8, 256))
+        _ = lin(torch.randn(8, 256))
+        H = store["hessians"]["nan_rot"]
+        assert torch.all(torch.isfinite(H))
+
+        # Pass input with NaN
+        x_nan = torch.randn(8, 256)
+        x_nan[3, 100] = float("nan")
+        _ = lin(x_nan)
+
+        assert torch.all(torch.isfinite(H)), (
+            "Hessian was corrupted by NaN forward pass with rotation"
+        )
+        assert collector._nan_skip_count > 0
+        collector.remove()
+
+    def test_nan_with_block_diagonal(self, calibration_mod):
+        """NaN guard works for block-diagonal Hessians."""
+        torch.manual_seed(0)
+        lin = nn.Linear(1024, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "nan_blk", store, "Linear", hessian_block_size=128, rot_size=0,
+        )
+        collector.register(lin)
+
+        # Clean pass
+        _ = lin(torch.randn(8, 1024))
+        blocks = store["hessians"]["nan_blk"]
+        assert isinstance(blocks, list)
+        assert all(torch.all(torch.isfinite(b)) for b in blocks)
+
+        # Pass input with NaN
+        x_nan = torch.randn(8, 1024)
+        x_nan[2, 500] = float("nan")
+        _ = lin(x_nan)
+
+        # No block should be corrupted
+        for i, block in enumerate(blocks):
+            assert torch.all(torch.isfinite(block)), (
+                f"Block {i} was corrupted by NaN forward pass"
+            )
+        assert collector._nan_skip_count > 0
+        collector.remove()
+
+    def test_nan_guard_skips_amax_update(self, calibration_mod):
+        """When a NaN pass is skipped, amax must not be updated with NaN.
+
+        Previously, ``_accumulate_amax`` would compute
+        ``x_flat.abs().max().item()`` → NaN, then ``NaN > prev`` → False,
+        so amax was NOT updated — which is the CORRECT outcome (amax should
+        stay finite).  The NaN guard now ensures x_flat never reaches
+        ``_accumulate_amax`` with NaN, but we verify the defensive check
+        in ``_accumulate_amax`` as well.
+        """
+        torch.manual_seed(0)
+        lin = nn.Linear(64, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "nan_amax", store, "Linear", hessian_block_size=0,
+            collect_amax=True,
+        )
+        collector.register(lin)
+
+        # Clean pass
+        _ = lin(torch.randn(8, 64) * 5)
+        assert store["amax"]["nan_amax"] > 0
+
+        # NaN pass — amax should stay finite
+        x_nan = torch.randn(8, 64)
+        x_nan[0, 0] = float("nan")
+        _ = lin(x_nan)
+
+        # amax must still be finite (not NaN)
+        amax_val = store["amax"]["nan_amax"]
+        assert amax_val == amax_val, f"amax became NaN: {amax_val}"  # NaN != NaN
+        collector.remove()
+
+    def test_clean_hessian_value_not_affected_by_nan_skip(self, calibration_mod):
+        """After a NaN-contaminated pass is skipped, the Hessian values
+        from clean passes should be exactly the same as if the NaN pass
+        never happened.
+        """
+        # Collect Hessian with only clean passes
+        lin1 = nn.Linear(64, 4, bias=False)
+        store_clean: dict = {}
+        c_clean = calibration_mod.ActivationStatsCollector(
+            "clean", store_clean, "Linear", hessian_block_size=0,
+        )
+        c_clean.register(lin1)
+        x1 = torch.randn(4, 64)
+        x2 = torch.randn(4, 64)
+        _ = lin1(x1)
+        _ = lin1(x2)
+        c_clean.remove()
+        H_clean = store_clean["hessians"]["clean"]
+
+        # Collect Hessian with clean passes + NaN pass in the middle
+        lin2 = nn.Linear(64, 4, bias=False)
+        store_mix: dict = {}
+        c_mix = calibration_mod.ActivationStatsCollector(
+            "mix", store_mix, "Linear", hessian_block_size=0,
+        )
+        c_mix.register(lin2)
+        # Same two clean inputs (same data, same weight init)
+        _ = lin2(x1)
+        _ = lin2(x2)
+        # NaN pass — should be skipped
+        x_nan = torch.randn(4, 64)
+        x_nan[0, 0] = float("nan")
+        _ = lin2(x_nan)
+        c_mix.remove()
+        H_mix = store_mix["hessians"]["mix"]
+
+        # H_mix should be finite (NaN pass was skipped) and equal to the
+        # clean Hessian since it accumulated the exact same clean inputs.
+        assert torch.all(torch.isfinite(H_mix))
+        assert torch.allclose(H_clean, H_mix, atol=1e-5)
+        assert c_mix._nan_skip_count == 1
+
+    def test_outlier_activations_skipped(self, calibration_mod):
+        """Activations with extremely large magnitudes (but finite) must be
+        skipped.  In bf16 diffusion models, certain timesteps produce
+        activations with amax ≈ 1e11 that poison the Hessian with values
+        like 1e20, making GPTQ's inverse Hessian unusable.
+        """
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 4, bias=False)
+        store: dict = {}
+        collector = calibration_mod.ActivationStatsCollector(
+            "outlier", store, "Linear", hessian_block_size=128, rot_size=0,
+        )
+        collector.register(lin)
+
+        # Clean pass
+        _ = lin(torch.randn(8, 256))
+        H = store["hessians"]["outlier"]
+        assert torch.all(torch.isfinite(H))
+
+        # Pass with extreme activations (simulates bf16 overflow producing
+        # huge but finite values, e.g. amax ≈ 1e11)
+        x_outlier = torch.randn(8, 256) * 1e8
+        _ = lin(x_outlier)
+
+        # Hessian must NOT be corrupted by the outlier pass
+        assert torch.all(torch.isfinite(H))
+        assert collector._nan_skip_count > 0
+        collector.remove()
 
