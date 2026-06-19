@@ -46,6 +46,7 @@ for _name in (
     "comfy.samplers",
     "comfy.sample",
     "comfy.model_management",
+    "comfy.sampler_helpers",
     "comfy.utils",
     "comfy.comfy_types",
 ):
@@ -77,8 +78,32 @@ sys.modules["comfy.samplers"].simple_scheduler = (
     lambda model_sampling, steps: torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32)
 )
 sys.modules["comfy.samplers"].sample = lambda *args, **kwargs: None
+sys.modules["comfy.samplers"].sampler_object = lambda name: types.SimpleNamespace(sample=lambda *a, **k: None)
 sys.modules["comfy.sample"].sample = lambda *args, **kwargs: None
 sys.modules["comfy.model_management"].soft_empty_cache = lambda: None
+sys.modules["comfy.sampler_helpers"].prepare_sampling = lambda *args, **kwargs: (None, {}, [])
+sys.modules["comfy.sampler_helpers"].cleanup_models = lambda *args, **kwargs: None
+
+
+# Minimal CFGGuider stub so _DualModelGuider can inherit from it at import time.
+class _StubCFGGuider:
+    def __init__(self, model_patcher):
+        self.model_patcher = model_patcher
+        self.model_options = getattr(model_patcher, "model_options", {})
+        self.conds = {}
+        self.cfg = 1.0
+
+    def set_conds(self, positive, negative):
+        self.conds = {"positive": positive, "negative": negative}
+
+    def set_cfg(self, cfg):
+        self.cfg = cfg
+
+    def sample(self, **kwargs):
+        return kwargs.get("noise", None)
+
+
+sys.modules["comfy.samplers"].CFGGuider = _StubCFGGuider
 sys.modules["comfy.utils"].ProgressBar = lambda total, node_id=None: types.SimpleNamespace(
     update_absolute=lambda *a, **k: None
 )

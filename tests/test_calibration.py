@@ -1,8 +1,4 @@
-"""Tests for ActivationStatsCollector and related calibration functions.
-
-Sections: basic Hessian/amax, block-diagonal, ConvRot rotation, PermuQuant
-(mu2 + permutations + permute_hessian), mode='both', NaN/Inf/outlier guard.
-"""
+"""Tests for ActivationStatsCollector and calibration helpers."""
 from __future__ import annotations
 
 import torch
@@ -11,12 +7,11 @@ import torch.nn.functional as F
 
 
 def _flatten_linear(x: torch.Tensor) -> torch.Tensor:
-    """Flatten to (rows, in_features) — mirrors ActivationStatsCollector._flatten_linear_input."""
     return x.reshape(-1, x.shape[-1])
 
 
 def _flatten_conv(x: torch.Tensor, module: nn.Conv2d) -> torch.Tensor:
-    """Unfold Conv2d to (patches, in_ch·kH·kW) — mirrors ActivationStatsCollector._flatten_conv_input."""
+    """Unfold Conv2d to (patches, in_ch·kH·kW)."""
     patches = F.unfold(
         x,
         module.kernel_size,
@@ -82,8 +77,7 @@ def test_block_wise_hessian_stores_diagonal_blocks(calibration_mod):
     assert len(got) == 8
     assert all(g.shape == (128, 128) for g in got)
 
-    # Diagonal blocks should match the corresponding diagonal block of the
-    # full H exactly. Off-diagonals are intentionally zero in block mode.
+    # Diagonal blocks should match the corresponding block of the full Hessian.
     for i in range(8):
         s = i * 128
         e = s + 128
@@ -195,8 +189,7 @@ def test_infer_latent_shape_uses_model_latent_format(calibration_mod):
     class FakePatcher:
         model = FakeModel()
 
-    # ``height``/``width`` are latent dimensions; we just take the
-    # channel count from the model's latent_format.
+    # Channel count from the model's latent_format.
     c, h, w = calibration_mod._infer_latent_shape(FakePatcher(), 128, 128)
     assert c == 16
     assert h == 128
@@ -207,7 +200,7 @@ def test_infer_latent_shape_fallback_when_no_model(calibration_mod):
     class FakePatcher:
         model = None
 
-    # No model -> default to 4 channels and use the literal arguments.
+    # No model -> default to 4 channels.
     c, h, w = calibration_mod._infer_latent_shape(FakePatcher(), 64, 64)
     assert c == 4
     assert h == 64
@@ -251,10 +244,7 @@ def test_collect_stats_validates_inputs(calibration_mod):
 
 
 def test_block_gram_last_block_has_actual_size(calibration_mod):
-    """``_block_gram`` must not crash when ``n_features`` is not a
-    multiple of ``block_size``; the final block retains its true size
-    instead of being zero-padded, preventing singular blocks.
-    """
+    """Last block retains its true size when n_features is not a multiple of block_size."""
     torch.manual_seed(0)
     n = 200
     block_size = 128
@@ -281,9 +271,7 @@ def test_block_gram_last_block_has_actual_size(calibration_mod):
 
 
 def test_block_gram_handles_n_smaller_than_block_size(calibration_mod):
-    """When ``n_features < block_size`` the single block is returned
-    at its true size instead of being padded.
-    """
+    """Single block returned at true size when n_features < block_size."""
     torch.manual_seed(0)
     x = torch.randn(2, 50)
     block_size = 128
@@ -298,12 +286,7 @@ def test_block_gram_handles_n_smaller_than_block_size(calibration_mod):
 
 
 def test_block_wise_hessian_works_for_non_divisible_layer(calibration_mod):
-    """End-to-end: a Linear with in_features not divisible by the
-    block size must produce a list of blocks with true sizes.
-
-    ``_use_block_gram`` triggers only when ``n_features > block_size * 4``,
-    so we pick 600 > 128*4.
-    """
+    """Block-diagonal with in_features not divisible by block_size."""
     torch.manual_seed(0)
     n = 600
     lin = nn.Linear(n, 8, bias=False)
@@ -327,12 +310,7 @@ def test_block_wise_hessian_works_for_non_divisible_layer(calibration_mod):
 
 
 def test_collect_stats_calls_comfy_sample_sample(calibration_mod, monkeypatch):
-    """Regression test: ``collect_stats`` must invoke
-    ``comfy.sample.sample`` (the high-level entry point that takes
-    ``sampler_name`` / ``scheduler`` / ``denoise``), not the
-    lower-level ``comfy.samplers.sample`` which has a different
-    signature.
-    """
+    """collect_stats must call comfy.sample.sample, not comfy.samplers.sample."""
     import comfy.sample as comfy_sample
     import comfy.samplers as comfy_samplers
 
@@ -374,7 +352,7 @@ def test_collect_stats_calls_comfy_sample_sample(calibration_mod, monkeypatch):
             self.load_device = torch.device("cpu")
             self.model_options = {}
 
-    # ComfyUI conditioning: each entry is [cross_attn_tensor, metadata_dict]
+    # ComfyUI conditioning: [[cross_attn_tensor, metadata_dict], ...]
     fake_cond = [[torch.randn(1, 4, 4), {"some_key": "some_val"}]]
 
     data = calibration_mod.collect_stats(
@@ -400,12 +378,7 @@ def test_collect_stats_calls_comfy_sample_sample(calibration_mod, monkeypatch):
 
 
 def test_collect_stats_preserves_conditioning_format(calibration_mod, monkeypatch):
-    """The conditioning passed to ``collect_stats`` must arrive at
-    ``comfy.sample.sample`` exactly as-is (``[[tensor, dict]]``),
-    without being flattened.  ``convert_cond`` in the real ComfyUI
-    sampler iterates the outer list and indexes ``c[1]`` — flattening
-    would break that.
-    """
+    """Conditioning [[tensor, dict]] must not be flattened before reaching comfy.sample.sample."""
     import comfy.sample as comfy_sample
 
     captured = {}
@@ -456,7 +429,7 @@ def test_collect_stats_preserves_conditioning_format(calibration_mod, monkeypatc
 
     pos = captured["positive"]
     neg = captured["negative"]
-    # Must still be [[tensor, dict]], NOT flattened to [tensor, dict]
+    # Must still be [[tensor, dict]], NOT flattened
     assert isinstance(pos, list), "positive should be a list"
     assert len(pos) == 1, "positive should have 1 entry"
     entry = pos[0]
@@ -604,11 +577,7 @@ class TestCollectorWithRotation:
         assert torch.allclose(store["hessians"]["lin"], expected, atol=1e-4)
 
     def test_rotated_hessian_matches_converter_rotation(self, calibration_mod):
-        """Rotated-space Hessian should match converter's rotate_hessian(unrotated_H).
-
-        This verifies the key equivalence:
-            rotate_activations(x).T @ rotate_activations(x)  ==  rotate_hessian(x.T @ x)
-        """
+        """Rotated-space Hessian should equal rotate(x).T @ rotate(x)."""
         torch.manual_seed(0)
         lin = nn.Linear(256, 4, bias=False)
         x = torch.randn(2, 256)
@@ -630,22 +599,14 @@ class TestCollectorWithRotation:
         c2.remove()
         H_rot = store_rot["hessians"]["rot"]
 
-        # Manually rotate the unrotated Hessian using the same Hadamard
-        # transform that rotate_activations applies.
-        # rotate_activations pads to multiple of rot_size then applies
-        # group-wise H.T. For the Hessian: H_rot_manual = (R @ x)^T (R @ x)
-        # which equals what rotate_hessian would produce.
+        # Manually rotate the unrotated Hessian.
         x_rot = calibration_mod.rotate_activations(x_flat, 256)
         H_rot_manual = x_rot.T @ x_rot
 
         assert torch.allclose(H_rot, H_rot_manual, atol=1e-3)
 
     def test_rotation_with_non_divisible_features(self, calibration_mod):
-        """Rotation works when in_features is not a multiple of rot_size.
-
-        The collector accumulates at the padded size (256x256).
-        collect_stats() crops back to the original size (128x128).
-        """
+        """Rotation pads to rot_size, collector accumulates at padded size."""
         torch.manual_seed(0)
         lin = nn.Linear(128, 4, bias=False)
         x = torch.randn(2, 128)
@@ -665,11 +626,7 @@ class TestCollectorWithRotation:
         assert torch.allclose(H, H.T, atol=1e-5)
 
     def test_rotation_block_diagonal_non_divisible(self, calibration_mod):
-        """Block-diagonal rotation works when in_features is not a multiple of rot_size.
-
-        The collector pads to rot_size (600→768) then blocks at 128 = 6 blocks.
-        collect_stats() crops back to the original 600 features.
-        """
+        """Block-diagonal rotation with non-divisible in_features."""
         torch.manual_seed(0)
         lin = nn.Linear(600, 4, bias=False)
         x = torch.randn(2, 600)
@@ -715,7 +672,7 @@ class TestPermuQuantMu2:
         assert torch.all(torch.isfinite(mu2_sum))
         assert torch.all(mu2_sum >= 0)
 
-        # mu2_sum should be the sum of x^2 across all samples (6 rows total)
+        # mu2_sum should be sum(x^2) across all 6 rows
         all_x = torch.cat([x.reshape(-1, 8) for x in xs])
         expected_sum = (all_x ** 2).sum(dim=0)
         assert torch.allclose(mu2_sum, expected_sum, atol=1e-3)
@@ -763,7 +720,7 @@ class TestPermuQuantMu2:
         mu2 = store["mu2"]["perm_test"]
         perm = mu2.argsort(descending=True)
 
-        # Channel 0 (highest mu2) should be first, channel 7 (lowest) should be last
+        # Highest mu2 first, lowest last
         assert perm[0].item() == 0
         assert perm[-1].item() == 7
 
@@ -791,7 +748,7 @@ class TestPermuQuantMu2:
         H1 = store1["hessians"]["nop"]
         H2 = store2["hessians"]["perm"]
 
-        # H2 should be H1 permuted: H2[i,j] = H1[perm[i], perm[j]]
+        # H2 = H1 permuted by perm
         H1_perm = H1[perm][:, perm]
         assert torch.allclose(H2, H1_perm, atol=1e-4)
 
@@ -834,8 +791,7 @@ class TestPermuteHessian:
         assert torch.allclose(H_perm, expected, atol=1e-5)
 
     def test_block_diagonal_list_permutation(self, calibration_mod):
-        """Permuting a block-diagonal Hessian (list of blocks) should produce
-        a valid result with the same block structure."""
+        """Permuting a block-diagonal Hessian preserves block structure."""
         torch.manual_seed(42)
         n = 256
         block_size = 64
@@ -953,9 +909,7 @@ class TestCollectorModeBoth:
 
 
 class TestPermuQuantConv2dBug3:
-    """Regression: PermuQuant was using in_channels instead of in_channels·kH·kW
-    for Conv2d, producing wrong mu2 shapes and out-of-range permutation indices.
-    """
+    """Regression: PermuQuant Conv2d in_features must use in_channels·kH·kW."""
 
     def test_conv2d_in_features_computed_from_flattened_shape(self, calibration_mod):
         """For Conv2d, in_features should be in_channels * kH * kW, not just in_channels."""
@@ -978,14 +932,7 @@ class TestPermuQuantConv2dBug3:
         )
 
     def test_permutation_in_rotated_space(self, calibration_mod):
-        """Permutation is computed in rotated space (PermuQuant-H).
-
-        mu2 is accumulated after rotation, so permutation indices correspond
-        to rotated channels.  For layers without padding (in_f divisible by
-        rot_size), indices stay in [0, in_f-1].  For layers with padding,
-        indices can reach alloc_f — the converter handles this via its
-        validation check.
-        """
+        """Permutation indices correspond to rotated channels."""
         torch.manual_seed(0)
         # 256 features, no padding (256 % 256 == 0)
         lin = nn.Linear(256, 4, bias=False)
@@ -1010,7 +957,7 @@ class TestPermuQuantConv2dBug3:
         assert perm.min() >= 0
 
     def test_permuquant_with_rotation_produces_valid_hessian(self, calibration_mod):
-        """End-to-end: mode='both' + rot_size + permuquant should produce valid Hessian."""
+        """mode='both' + rot_size should produce valid Hessian and mu2."""
         torch.manual_seed(0)
         lin = nn.Linear(256, 4, bias=False)
         x = torch.randn(2, 256)
@@ -1040,27 +987,10 @@ class TestPermuQuantConv2dBug3:
 # ── NaN guard tests ─────────────────────────────────────────────────────────
 
 class TestNaNGuard:
-    """Tests for the NaN/Inf guard that prevents corrupted forward passes
-    from permanently poisoning the Hessian blocks.
-
-    When the model runs in bf16/fp16, some timesteps can produce NaN
-    activations.  Previously, ``block.add_(xi.T @ xi)`` with NaN input
-    permanently corrupted the block (NaN + anything = NaN).  Meanwhile,
-    ``_accumulate_amax`` silently hid the NaN because ``NaN > prev`` is
-    False in Python — so the amax stayed finite while the Hessian rotted.
-
-    Now ``_hook_fn`` checks ``torch.isfinite(x_flat).all()`` before
-    any accumulation and skips the forward pass if NaN/Inf is found.
-    """
+    """NaN/Inf/outlier guard prevents corrupted passes from poisoning the Hessian."""
 
     def test_nan_input_does_not_corrupt_hessian(self, calibration_mod):
-        """A NaN-contaminated forward pass must not corrupt the Hessian
-        that was already accumulated from clean passes.
-
-        In a real diffusion model the NaN comes from a previous layer's
-        output (in bf16), which becomes the *input* to the next layer's
-        hook.  We simulate this by passing a tensor with NaN directly.
-        """
+        """NaN-contaminated forward pass must not corrupt the Hessian."""
         torch.manual_seed(0)
         lin = nn.Linear(256, 4, bias=False)
         store: dict = {}
@@ -1077,14 +1007,12 @@ class TestNaNGuard:
         H = store["hessians"]["nan_test"]
         assert torch.all(torch.isfinite(H)), "Clean Hessian should be finite"
 
-        # Pass an input with NaN — simulates a bf16 model producing NaN
-        # activations at a certain timestep, which the pre-hook captures
-        # as the input to this layer.
+        # Pass input with NaN
         x_nan = torch.randn(8, 256)
         x_nan[3, 100] = float("nan")
         _ = lin(x_nan)
 
-        # The Hessian must NOT have been corrupted by the NaN pass
+        # Hessian must not be corrupted
         assert torch.all(torch.isfinite(H)), (
             "Hessian was corrupted by NaN forward pass — the NaN guard failed"
         )
@@ -1121,13 +1049,7 @@ class TestNaNGuard:
         collector.remove()
 
     def test_nan_with_rotation(self, calibration_mod):
-        """NaN guard works when ConvRot rotation is enabled.
-
-        The Hadamard rotation spreads one NaN feature across all 256
-        features in its group, making the entire xi.T @ xi block NaN.
-        The guard must catch this BEFORE the rotation to avoid wasted
-        GPU compute, and also after as a defensive check.
-        """
+        """NaN guard works with ConvRot rotation enabled."""
         torch.manual_seed(0)
         lin = nn.Linear(256, 4, bias=False)
         store: dict = {}
@@ -1183,15 +1105,7 @@ class TestNaNGuard:
         collector.remove()
 
     def test_nan_guard_skips_amax_update(self, calibration_mod):
-        """When a NaN pass is skipped, amax must not be updated with NaN.
-
-        Previously, ``_accumulate_amax`` would compute
-        ``x_flat.abs().max().item()`` → NaN, then ``NaN > prev`` → False,
-        so amax was NOT updated — which is the CORRECT outcome (amax should
-        stay finite).  The NaN guard now ensures x_flat never reaches
-        ``_accumulate_amax`` with NaN, but we verify the defensive check
-        in ``_accumulate_amax`` as well.
-        """
+        """Skipped NaN pass must not update amax with NaN."""
         torch.manual_seed(0)
         lin = nn.Linear(64, 4, bias=False)
         store: dict = {}
@@ -1216,10 +1130,7 @@ class TestNaNGuard:
         collector.remove()
 
     def test_clean_hessian_value_not_affected_by_nan_skip(self, calibration_mod):
-        """After a NaN-contaminated pass is skipped, the Hessian values
-        from clean passes should be exactly the same as if the NaN pass
-        never happened.
-        """
+        """Hessian from clean passes is unchanged when a NaN pass is skipped."""
         # Collect Hessian with only clean passes
         lin1 = nn.Linear(64, 4, bias=False)
         store_clean: dict = {}
@@ -1251,18 +1162,13 @@ class TestNaNGuard:
         c_mix.remove()
         H_mix = store_mix["hessians"]["mix"]
 
-        # H_mix should be finite (NaN pass was skipped) and equal to the
-        # clean Hessian since it accumulated the exact same clean inputs.
+        # H_mix should equal H_clean (same clean inputs, NaN pass was skipped).
         assert torch.all(torch.isfinite(H_mix))
         assert torch.allclose(H_clean, H_mix, atol=1e-5)
         assert c_mix._nan_skip_count == 1
 
     def test_outlier_activations_skipped(self, calibration_mod):
-        """Activations with extremely large magnitudes (but finite) must be
-        skipped.  In bf16 diffusion models, certain timesteps produce
-        activations with amax ≈ 1e11 that poison the Hessian with values
-        like 1e20, making GPTQ's inverse Hessian unusable.
-        """
+        """Extremely large activations must be skipped to avoid Hessian overflow."""
         torch.manual_seed(0)
         lin = nn.Linear(256, 4, bias=False)
         store: dict = {}
@@ -1276,8 +1182,7 @@ class TestNaNGuard:
         H = store["hessians"]["outlier"]
         assert torch.all(torch.isfinite(H))
 
-        # Pass with extreme activations (simulates bf16 overflow producing
-        # huge but finite values, e.g. amax ≈ 1e11)
+        # Pass with extreme activations
         x_outlier = torch.randn(8, 256) * 1e8
         _ = lin(x_outlier)
 
@@ -1285,4 +1190,80 @@ class TestNaNGuard:
         assert torch.all(torch.isfinite(H))
         assert collector._nan_skip_count > 0
         collector.remove()
+
+
+# ── Sigma clipping tests ─────────────────────────────────────────────────────
+
+class TestSigmaClipping:
+    """Tests for _build_sigmas with sigma_min / sigma_max range clipping."""
+
+    def test_full_range_unchanged(self, calibration_mod):
+        """Default sigma_min=0, sigma_max=1 should return the schedule as-is."""
+        s = calibration_mod._build_sigmas(None, num_steps=4)
+        assert s.shape == (5,)
+        assert s[0].item() == 1.0
+        assert s[-1].item() == 0.0
+
+    def test_clip_high_noise_regime(self, calibration_mod):
+        """sigma_min=0.5, sigma_max=1.0 should only keep sigmas in [0.5, 1.0]."""
+        s = calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.5, sigma_max=1.0)
+        assert abs(s[0].item() - 1.0) < 1e-4
+        assert abs(s[-1].item() - 0.5) < 1e-4
+        assert all(0.5 - 1e-4 <= v.item() <= 1.0 + 1e-4 for v in s)
+
+    def test_clip_low_noise_regime(self, calibration_mod):
+        """sigma_min=0.0, sigma_max=0.5 should only keep sigmas in [0, 0.5]."""
+        s = calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.0, sigma_max=0.5)
+        assert abs(s[0].item() - 0.5) < 1e-4
+        assert abs(s[-1].item() - 0.0) < 1e-4
+        assert all(0.0 - 1e-4 <= v.item() <= 0.5 + 1e-4 for v in s)
+
+    def test_clip_both_sides(self, calibration_mod):
+        """sigma_min=0.2, sigma_max=0.8 should produce sigmas in [0.2, 0.8]."""
+        s = calibration_mod._build_sigmas(None, num_steps=10, sigma_min=0.2, sigma_max=0.8)
+        assert abs(s[0].item() - 0.8) < 1e-4
+        assert abs(s[-1].item() - 0.2) < 1e-4
+        assert all(0.2 - 1e-4 <= v.item() <= 0.8 + 1e-4 for v in s)
+
+    def test_effective_steps_may_be_fewer(self, calibration_mod):
+        """Clipping reduces the effective number of sampling steps."""
+        # 4 steps linear: [1.0, 0.75, 0.5, 0.25, 0.0]
+        # Clip to [0.5, 1.0]: keep [1.0, 0.75, 0.5] + append 0.5 → [1.0, 0.75, 0.5]
+        s = calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.5, sigma_max=1.0)
+        assert s.shape[0] - 1 < 4  # fewer effective steps
+
+    def test_min_greater_than_max_raises(self, calibration_mod):
+        """sigma_min > sigma_max must raise ValueError."""
+        try:
+            calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.9, sigma_max=0.1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for sigma_min > sigma_max")
+
+    def test_min_equals_max_raises(self, calibration_mod):
+        """sigma_min == sigma_max must raise ValueError (no steps possible)."""
+        try:
+            calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.5, sigma_max=0.5)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for sigma_min == sigma_max")
+
+    def test_at_least_two_sigmas(self, calibration_mod):
+        """Degenerate clipping must still produce ≥2 sigmas."""
+        # Tight range that would produce only 1 sigma after clamp
+        s = calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.501, sigma_max=0.502)
+        assert s.shape[0] >= 2
+
+    def test_wan22_boundary(self, calibration_mod):
+        """Realistic Wan 2.2 boundary=0.875 with 20 steps."""
+        # High-noise expert
+        s_high = calibration_mod._build_sigmas(None, num_steps=20, sigma_min=0.875, sigma_max=1.0)
+        assert abs(s_high[0].item() - 1.0) < 1e-4
+        assert abs(s_high[-1].item() - 0.875) < 1e-4
+        # Low-noise expert
+        s_low = calibration_mod._build_sigmas(None, num_steps=20, sigma_min=0.0, sigma_max=0.875)
+        assert abs(s_low[0].item() - 0.875) < 1e-4
+        assert abs(s_low[-1].item() - 0.0) < 1e-4
 

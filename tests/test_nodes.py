@@ -11,6 +11,7 @@ from unittest import mock
 def test_node_class_mappings_keys_present():
     expected_nodes = {
         "CalibrationDataCollector",
+        "DualModelCalibrationDataCollector",
     }
 
     with mock.patch.dict("sys.modules", {

@@ -1,5 +1,40 @@
+import logging
 import os
+
 import torch
+
+logger = logging.getLogger("comfyui_gptq_calibration")
+
+
+def default_dual_output_paths(base_path: str | None = None) -> tuple[str, str]:
+    """Derive ``<base>_positive.pt`` and ``<base>_negative.pt`` output paths.
+
+    If *base_path* is ``None``, uses the ComfyUI output directory.
+    If *base_path* ends with ``.pt``, the suffix is stripped and replaced.
+    Raises ``ValueError`` if the two paths resolve to the same location.
+    """
+    try:
+        import folder_paths
+        default_dir = folder_paths.get_output_directory() if hasattr(folder_paths, "get_output_directory") else folder_paths.output_directory
+    except ImportError:
+        default_dir = "/tmp"
+
+    if base_path is None or not base_path.strip():
+        base = os.path.join(default_dir, "calibration")
+    else:
+        base = base_path
+        if base.endswith(".pt"):
+            base = base[:-3]
+
+    pos = f"{base}_positive.pt"
+    neg = f"{base}_negative.pt"
+
+    if os.path.realpath(pos) == os.path.realpath(neg):
+        raise ValueError(
+            f"output_path_positive and output_path_negative resolve to the same "
+            f"path: {os.path.realpath(pos)}.  Use different paths."
+        )
+    return pos, neg
 
 
 def save_calibration(data: dict, path: str) -> str:
@@ -24,9 +59,15 @@ def estimate_disk_size(num_layers: int,
                        avg_in_features: int,
                        hessian_block_size: int = 0,
                        collect_amax: bool = True,
-                       dtype_bytes: int = 4) -> dict:
+                       dtype_bytes: int = 4,
+                       hessian_format: str = "block",
+                       dlr_rank: int = 0) -> dict:
     """Estimate output file size. Returns dict with hessian_bytes, amax_bytes, total_bytes, total_gb."""
-    if hessian_block_size and hessian_block_size > 0:
+    if hessian_format == "dlr" and dlr_rank > 0:
+        rank = min(dlr_rank, avg_in_features)
+        # DLR stores D (n floats) + U (n * rank floats)
+        per_layer = (avg_in_features + avg_in_features * rank) * dtype_bytes
+    elif hessian_block_size and hessian_block_size > 0:
         block = hessian_block_size
         num_blocks = max(1, (avg_in_features + block - 1) // block)
         per_layer = num_blocks * block * block * dtype_bytes
