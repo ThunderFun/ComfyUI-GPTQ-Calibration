@@ -2,9 +2,20 @@
 
 ComfyUI's runtime modules (``comfy.*``, ``folder_paths``) are not
 installable on their own, so the test suite uses stubs to allow
-importing the calibration modules. The stubs are installed at *import
+importing the calibration modules.  The stubs are installed at *import
 time* (not in a fixture) so they are present before pytest begins
 collecting test modules.
+
+Import conventions for test authors:
+
+- **calibration_mod / utils_mod fixtures**: Use for modules that touch
+  ``comfy.*`` at import time (calibration.py, nodes.py).  These are loaded
+  via ``spec_from_file_location`` so the real ``__init__.py`` (which has a
+  try/except for relative vs absolute imports) is not executed.
+- **Direct import**: Works for ``utils.py`` and ``kernels/`` which don't
+  depend on ``comfy.*``.
+- **Mock patching**: ``test_nodes.py`` uses ``mock.patch.dict`` to import
+  the real package's ``__init__`` in isolation.
 """
 
 from __future__ import annotations
@@ -19,7 +30,6 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PKG_DIR = REPO_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +38,11 @@ PKG_DIR = REPO_ROOT
 # ---------------------------------------------------------------------------
 
 def _install_stub(name: str, package: bool = False) -> types.ModuleType:
+    """Install a stub module into ``sys.modules`` if not already present.
+
+    Idempotent: returns the existing module if *name* is already in
+    ``sys.modules``.
+    """
     if name in sys.modules:
         return sys.modules[name]
     mod = types.ModuleType(name)
@@ -114,23 +129,34 @@ sys.modules["folder_paths"].output_directory = str(REPO_ROOT / "tests" / "_outpu
 # ---------------------------------------------------------------------------
 # Pre-load the real modules so tests can import them via the
 # comfyui_gptq_calibration namespace.
+#
+# The real __init__.py's try/except fallback (relative vs absolute import)
+# is NOT exercised here — test_nodes.py covers that path separately via
+# mock.patch.dict.
 # ---------------------------------------------------------------------------
 
 _pkg_stub = _install_stub("comfyui_gptq_calibration")
-_pkg_stub.__path__ = [str(PKG_DIR)]  # type: ignore[attr-defined]
+_pkg_stub.__path__ = [str(REPO_ROOT)]  # type: ignore[attr-defined]
 
 
 def _load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    """Load a module from *path* into ``sys.modules[name]``."""
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {name} from {path}.  "
+            f"Check that all comfy.* stubs are installed correctly: {exc}"
+        ) from exc
 
 
-_utils_mod = _load("comfyui_gptq_calibration._utils", PKG_DIR / "utils.py")
-_calibration_mod = _load("comfyui_gptq_calibration._calibration", PKG_DIR / "calibration.py")
-_nodes_mod = _load("comfyui_gptq_calibration._nodes", PKG_DIR / "nodes.py")
+_utils_mod = _load("comfyui_gptq_calibration._utils", REPO_ROOT / "utils.py")
+_calibration_mod = _load("comfyui_gptq_calibration._calibration", REPO_ROOT / "calibration.py")
+_nodes_mod = _load("comfyui_gptq_calibration._nodes", REPO_ROOT / "nodes.py")
 # Re-export under the public name so ``from comfyui_gptq_calibration.utils
 # import ...`` works in test modules.
 sys.modules["comfyui_gptq_calibration.utils"] = _utils_mod

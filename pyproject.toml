@@ -1,0 +1,31 @@
+[project]
+name = "comfyui-gptq-calibration"
+version = "0.1.0"
+description = "ComfyUI custom node for collecting per-layer activation statistics (Hessians, amax) for external GPTQ/OBQ/ConvRot quantization."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch",
+    "numpy",
+]
+
+[project.optional-dependencies]
+triton = ["triton"]
+dev = ["pytest>=7.0"]
+
+# ── Ruff ────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+# ── Pytest ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]

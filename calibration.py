@@ -8,27 +8,95 @@ mu2 = per-channel second moment; rot_size = Hadamard group size;
 block_size = on-diagonal Hessian block size (0 = full).
 """
 
+# ── Standard library ───────────────────────────────────────────────────────
 import datetime
 import gc
 import logging
 import math
+import os
+import tempfile
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
+# ── Third-party ────────────────────────────────────────────────────────────
+import numpy as np
 import torch
 import torch.nn as nn
 
-import comfy.samplers
-import comfy.sample
+# ── First-party (ComfyUI) ─────────────────────────────────────────────────
 import comfy.model_management
+import comfy.sample
 import comfy.sampler_helpers
+import comfy.samplers
 
-import numpy as np
-import os
-import tempfile
+# Optional: Triton FHT kernel for O(N log N) rotation on GPU.
+# Falls back to the CPU matmul path when Triton/CUDA unavailable.
+try:
+    from kernels.triton_fht_rotate import fht_rotate as _fht_rotate
+except ImportError:
+    _fht_rotate = None
 
 
 logger = logging.getLogger("comfyui_gptq_calibration")
+
+__all__ = [
+    "collect_stats",
+    "collect_stats_dual",
+    "rotate_activations",
+    "get_hadamard",
+    "permute_hessian",
+    "ActivationStatsCollector",
+    "FrequentDirections",
+]
+
+
+# ── Module-level constants ─────────────────────────────────────────────────
+
+# Layer type strings used throughout the module and serialized into the
+# output ``layer_types`` dict.  Centralised here to prevent typos.
+_LAYER_TYPE_LINEAR: str = "Linear"
+_LAYER_TYPE_CONV2D: str = "Conv2d"
+
+# Block-diagonal Hessian threshold: only use block-gram when n_features
+# exceeds block_size by this factor.  Avoids accuracy loss on small layers.
+_BLOCK_GRAM_MIN_FEATURES_RATIO: int = 4
+
+# Headroom added to FrequentDirections sketch size so a single insert after
+# truncation doesn't immediately re-trigger it.
+_DLR_SKETCH_SLOP: int = 4
+
+# Corruption-detection thresholds for _validate_hessians.
+# _CORRUPTION_MAX_VAL: minimum max absolute value to trigger outlier check.
+# _CORRUPTION_DIAG_RATIO: max/diagonal ratio indicating outlier corruption.
+# _CORRUPTION_SYM_RATIO: maximum tolerable relative asymmetry.
+# _CORRUPTION_MIN_MAG: minimum magnitude to trigger asymmetry check.
+_CORRUPTION_MAX_VAL: float = 1e6
+_CORRUPTION_DIAG_RATIO: float = 1e3
+_CORRUPTION_SYM_RATIO: float = 0.01
+_CORRUPTION_MIN_MAG: float = 1e3
+
+# CUDA cache clear interval (in samples) to prevent OOM during long runs.
+_CACHE_CLEAR_INTERVAL: int = 4
+
+# Default damping ratio advertised in calibration metadata.
+_RECOMMENDED_DAMPING_RATIO: float = 0.01
+
+# Default sampler configuration for the calibration sampling loop.
+_DEFAULT_SAMPLER: str = "euler"
+_DEFAULT_SCHEDULER: str = "simple"
+_DEFAULT_CFG: float = 1.0
+
+# Bitmask selecting every other bit (even positions, 0-indexed).  A power
+# of 4 has exactly one 1-bit at an even position, so
+# (n & _POWER_OF_FOUR_MASK) == n.
+_POWER_OF_FOUR_MASK: int = 0x55555555
+
+# Activation ceiling: skip activations whose max absolute value exceeds
+# this to avoid float32 overflow when computing xᵀx.
+_ACT_AMAX_CEILING: float = 1e6
+
+
+# ── Utilities ──────────────────────────────────────────────────────────────
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -43,25 +111,59 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h {m}m {s}s"
 
 
-# Optional: Triton FHT kernel for O(N log N) rotation on GPU.
-# Falls back to the CPU matmul path when Triton/CUDA unavailable.
-try:
-    from kernels.triton_fht_rotate import fht_rotate as _fht_rotate
-except ImportError:
-    _fht_rotate = None
+def _classify_layer(module: nn.Module) -> str:
+    """Return the canonical layer-type string for *module* (``'Linear'`` or ``'Conv2d'``)."""
+    if isinstance(module, nn.Conv2d):
+        return _LAYER_TYPE_CONV2D
+    return _LAYER_TYPE_LINEAR
 
 
-# ── ConvRot Hadamard rotation ──
+def _compute_eta(done: int, total: int, sample_start: float,
+                 overall_start: float) -> Tuple[float, float, float]:
+    """Return ``(elapsed, avg_per_sample, remaining_eta)`` in seconds."""
+    elapsed = time.time() - sample_start
+    total_elapsed = time.time() - overall_start
+    avg = total_elapsed / done
+    remaining = avg * (total - done)
+    return elapsed, avg, remaining
+
+
+def _resolve_mmap_dir(base_path: Optional[str]) -> Optional[str]:
+    """Return a temp directory for memory-mapped Hessian files, or ``None``.
+
+    If *base_path* is given the mmap directory is created next to it;
+    otherwise ``tempfile.gettempdir()`` is used.
+    """
+    if base_path:
+        d = os.path.join(os.path.dirname(os.path.abspath(base_path)), ".gptq_hessian_tmp")
+    else:
+        d = os.path.join(tempfile.gettempdir(), "gptq_hessian_tmp")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _dlr_sketch_size(rank: int) -> int:
+    """Return the FrequentDirections sketch size for a given rank.
+
+    The ``_DLR_SKETCH_SLOP`` headroom prevents immediate re-truncation
+    after a single insert.
+    """
+    return 2 * rank + _DLR_SKETCH_SLOP
+
+
+# ── ConvRot Hadamard rotation ──────────────────────────────────────────────
 
 # Hadamard construction is O(n²) via Kronecker product — caching avoids
 # redundant reconstruction when the same rot_size is used across layers.
 _HADAMARD_CACHE: Dict[tuple, torch.Tensor] = {}
 
+
 def _is_power_of_four(n: int) -> bool:
-    """Return True if n is a power of 4 (4, 16, 64, 256, ...)."""
+    """Return True if *n* is a power of 4 (4, 16, 64, 256, ...)."""
     if n < 4:
         return False
-    return (n & (n - 1)) == 0 and (n & 0x55555555) == n
+    return (n & (n - 1)) == 0 and (n & _POWER_OF_FOUR_MASK) == n
+
 
 def get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     """Return an orthonormal Hadamard matrix of the given size (must be a power of 2).
@@ -97,6 +199,7 @@ def get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     _HADAMARD_CACHE[key] = H
     return H
 
+
 def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     """Apply group-wise Hadamard rotation, padding the last dim to a multiple of ``rot_size``.
 
@@ -119,11 +222,13 @@ def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     return x_rotated.reshape(*leading_shape, in_features)
 
 
-def permute_hessian(H, perm: torch.Tensor):
+def permute_hessian(H: Union[Dict, List[torch.Tensor], torch.Tensor],
+                    perm: torch.Tensor) -> Union[Dict, List[torch.Tensor], torch.Tensor]:
     """Permute a Hessian matrix according to a channel reordering.
 
     Supports: ``dict`` (DLR), ``list[Tensor]`` (block-diagonal),
     ``Tensor(dim=3)`` (stacked blocks), ``Tensor(dim=2)`` (full).
+    Returns the same container type as *H*.
     """
     perm = perm.to(torch.int64)
 
@@ -135,6 +240,10 @@ def permute_hessian(H, perm: torch.Tensor):
         return new_H
 
     if isinstance(H, list):
+        # ── Block-diagonal permutation ────────────────────────────────
+        # Phase 1: build global_index → (block, local_index) lookup tables.
+        # Phase 2: for each output block, gather entries whose row and col
+        # originate in the same source block (cross-block entries are zero).
         # List processing builds CPU helper tensors — move perm to CPU.
         perm = perm.cpu()
         block_sizes = [b.shape[0] for b in H]
@@ -143,36 +252,51 @@ def permute_hessian(H, perm: torch.Tensor):
         for bs in block_sizes:
             offsets.append(offsets[-1] + bs)
         n = offsets[-1]
+        perm_n = perm.size(0)
 
-        # Phase 1: build global_index → (block, local_index) lookup
-        block_of = torch.empty(n, dtype=torch.int64)
-        local_of = torch.empty(n, dtype=torch.int64)
+        # perm may be smaller than n when PermuQuant crops padding
+        # (e.g. convrot with non-divisible in_features).  Only permute
+        # blocks that fall within [0, perm_n).
+        block_of = torch.empty(perm_n, dtype=torch.int64)
+        local_of = torch.empty(perm_n, dtype=torch.int64)
+        filled = 0
         for bi, bs in enumerate(block_sizes):
-            s = offsets[bi]
-            block_of[s:s + bs] = bi
-            local_of[s:s + bs] = torch.arange(bs)
+            take = min(bs, perm_n - filled)
+            if take <= 0:
+                break
+            block_of[filled:filled + take] = bi
+            local_of[filled:filled + take] = torch.arange(take)
+            filled += take
 
         perm_block = block_of[perm]
         perm_local = local_of[perm]
 
-        # Phase 2: build each output block from entries whose row and col
-        # originate in the same source block (cross-block entries are zero)
+        # Build a mask for each block to select only rows that fall within
+        # perm_n (avoids out-of-bounds slicing when perm_n < n).
+        block_mask = torch.arange(perm_n)
+        h_device = H[0].device
+
         new_blocks = []
         for i in range(num_blocks):
             ri = offsets[i]
             bs_i = block_sizes[i]
-            rb = perm_block[ri:ri + bs_i]
-            rl = perm_local[ri:ri + bs_i]
+            # Rows in the perm that map to this output block's range.
+            mask = (block_mask >= ri) & (block_mask < ri + bs_i)
+            if not mask.any():
+                continue  # padding block — drop entirely
 
-            block = torch.zeros(bs_i, bs_i, dtype=H[0].dtype)
-            for li in range(bs_i):
+            rb = perm_block[mask]
+            rl = perm_local[mask]
+            actual_size = rb.size(0)
+
+            block = torch.zeros(actual_size, actual_size, dtype=H[0].dtype, device=h_device)
+            for li in range(actual_size):
                 k = rb[li].item()
                 same = (rb == k)
                 if same.any():
                     block[li, same] = H[k][rl[li], rl[same]]
             new_blocks.append(block)
 
-        del H
         return new_blocks
 
     if isinstance(H, torch.Tensor):
@@ -187,7 +311,6 @@ def permute_hessian(H, perm: torch.Tensor):
             for i in range(num_blocks):
                 start = i * block_size
                 H_full[start:start + block_size, start:start + block_size] = H[i]
-            del H
             H_perm = H_full[perm][:, perm]
             del H_full
             blocks = []
@@ -204,8 +327,9 @@ class FrequentDirections:
 
     Inspired by Frequent Directions (Liberty, KDD 2013), but uses plain
     truncated SVD (keeps top-ℓ/2 singular values, no σ² subtraction).
-    An exact per-channel diagonal ``_diag`` is accumulated separately
-    and used to form the residual diagonal in :meth:`dlr_decompose`.
+    Here ℓ = :attr:`sketch_size`.  An exact per-channel diagonal ``_diag``
+    is accumulated separately and used to form the residual diagonal in
+    :meth:`dlr_decompose`.
     """
 
     def __init__(self, n: int, sketch_size: int, rank: int, device=None):
@@ -261,7 +385,7 @@ class FrequentDirections:
         self.sketch[keep:] = 0
         self._next_row = keep
 
-    def dlr_decompose(self) -> tuple:
+    def dlr_decompose(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(D, U)`` such that ``D + UUᵀ ≈ XᵀX``.
 
         ``D`` is the residual diagonal (``_diag − diag(UUᵀ)``, clamped ≥ 0)
@@ -324,10 +448,12 @@ class ActivationStatsCollector:
         self._nan_skip_count: int = 0
 
     def register(self, module: nn.Module) -> None:
+        """Attach a ``forward_pre_hook`` to *module* that accumulates stats."""
         handle = module.register_forward_pre_hook(self._hook_fn)
         self.hooks.append(handle)
 
     def remove(self) -> None:
+        """Remove all hooks and finalize any DLR sketch."""
         for h in self.hooks:
             h.remove()
         self.hooks.clear()
@@ -352,16 +478,21 @@ class ActivationStatsCollector:
     # ---- internal helpers ------------------------------------------------
 
     def _use_block_gram(self, n_features: int) -> bool:
-        """Block-diagonal only when n_features is much larger than block_size
-        (×4 threshold avoids accuracy loss on small layers).
-        """
-        return self.hessian_block_size > 0 and n_features > self.hessian_block_size * 4
+        """Block-diagonal only when n_features is much larger than block_size.
 
-    def _make_fd(self, n_features: int) -> FrequentDirections:
+        The ``_BLOCK_GRAM_MIN_FEATURES_RATIO`` threshold avoids accuracy
+        loss on small layers (same ratio as in ``_allocate_layer_buffers``).
+        """
+        return (self.hessian_block_size > 0
+                and n_features > self.hessian_block_size * _BLOCK_GRAM_MIN_FEATURES_RATIO)
+
+    def _make_fd(self, n_features: int, device=None) -> FrequentDirections:
         """Create a FrequentDirections sketch sized for this layer."""
         rank = min(self.dlr_rank, n_features)
-        sketch_size = 2 * rank + 4
-        return FrequentDirections(n=n_features, sketch_size=sketch_size, rank=rank)
+        return FrequentDirections(
+            n=n_features, sketch_size=_dlr_sketch_size(rank), rank=rank,
+            device=device,
+        )
 
     def _flatten_linear_input(self, x: torch.Tensor) -> torch.Tensor:
         """Flatten to ``(rows, in_features)``."""
@@ -380,55 +511,75 @@ class ActivationStatsCollector:
         return patches.reshape(-1, patches.shape[-1])
 
     def _accumulate_hessian(self, x_flat: torch.Tensor) -> None:
-        """Accumulate ``xᵀx`` into the Hessian for this layer."""
+        """Accumulate ``xᵀx`` into the Hessian for this layer.
+
+        Dispatches to the correct accumulator based on the current Hessian
+        storage format (DLR sketch, block-diagonal list, stacked tensor,
+        or full dense/mmap tensor).
+        """
         hessians = self.store.setdefault("hessians", {})
         row_counts = self.store.setdefault("_hessian_row_count", {})
         n_rows = x_flat.shape[0]
 
         existing = hessians.get(self.layer_name)
         if existing is None:
-            if self.hessian_format == "dlr":
-                fd = self._make_fd(x_flat.shape[1])
-                fd.update(x_flat)
-                hessians[self.layer_name] = fd
-            elif self._use_block_gram(x_flat.shape[1]):
-                hessians[self.layer_name] = self._block_gram(x_flat, self.hessian_block_size)
-            else:
-                hessians[self.layer_name] = x_flat.T @ x_flat
+            self._init_hessian(hessians, x_flat)
         else:
-            if isinstance(existing, FrequentDirections):
-                existing.update(x_flat)
-            elif isinstance(existing, list):
-                block_size = self.hessian_block_size
-                for i, block in enumerate(existing):
-                    start = i * block_size
-                    end = min((i + 1) * block_size, x_flat.shape[1])
-                    if start >= x_flat.shape[1]:
-                        break
-                    xi = x_flat[:, start:end]
-                    block.add_(xi.T @ xi)
-            elif existing.dim() == 3:
-                # backward-compat for old stacked-tensor format
-                block_size = existing.shape[1]
-                num_blocks = existing.shape[0]
-                n = x_flat.shape[1]
-                for i in range(num_blocks):
-                    start = i * block_size
-                    end = min((i + 1) * block_size, n)
-                    xi = x_flat[:, start:end]
-                    width = end - start
-                    if width < block_size:
-                        xi = torch.nn.functional.pad(xi, (0, block_size - width))
-                    existing[i].add_(xi.T @ xi)
-            else:
-                # Full Hessian (Tensor, possibly mmap'd on CPU).
-                # When force_cpu=False the activation is on GPU but the mmap
-                # buffer is on CPU — move the activation to match.
-                if x_flat.device != existing.device:
-                    x_flat = x_flat.to(existing.device)
-                existing.add_(x_flat.T @ x_flat)
+            self._update_hessian(existing, x_flat)
 
         row_counts[self.layer_name] = row_counts.get(self.layer_name, 0) + n_rows
+
+    def _init_hessian(self, hessians: Dict, x_flat: torch.Tensor) -> None:
+        """Allocate and initialize the Hessian store for this layer (first call)."""
+        if self.hessian_format == "dlr":
+            fd = self._make_fd(x_flat.shape[1], device=x_flat.device)
+            fd.update(x_flat)
+            hessians[self.layer_name] = fd
+        elif self._use_block_gram(x_flat.shape[1]):
+            hessians[self.layer_name] = self._block_gram(x_flat, self.hessian_block_size)
+        else:
+            hessians[self.layer_name] = x_flat.T @ x_flat
+
+    def _update_hessian(self, existing, x_flat: torch.Tensor) -> None:
+        """Update an existing Hessian store with new activations."""
+        if isinstance(existing, FrequentDirections):
+            existing.update(x_flat)
+        elif isinstance(existing, list):
+            self._update_block_list(existing, x_flat)
+        elif existing.dim() == 3:
+            self._update_stacked_tensor(existing, x_flat)
+        else:
+            # Full Hessian (Tensor, possibly mmap'd on CPU).
+            # When force_cpu=False the activation is on GPU but the mmap
+            # buffer is on CPU — move the activation to match.
+            if x_flat.device != existing.device:
+                x_flat = x_flat.to(existing.device)
+            existing.add_(x_flat.T @ x_flat)
+
+    def _update_block_list(self, blocks: List[torch.Tensor], x_flat: torch.Tensor) -> None:
+        """Accumulate xᵀx into a block-diagonal list of tensors."""
+        block_size = self.hessian_block_size
+        for i, block in enumerate(blocks):
+            start = i * block_size
+            end = min((i + 1) * block_size, x_flat.shape[1])
+            if start >= x_flat.shape[1]:
+                break
+            xi = x_flat[:, start:end]
+            block.add_(xi.T @ xi)
+
+    def _update_stacked_tensor(self, existing: torch.Tensor, x_flat: torch.Tensor) -> None:
+        """Accumulate xᵀx into a stacked 3-D tensor (backward-compat format)."""
+        block_size = existing.shape[1]
+        num_blocks = existing.shape[0]
+        n = x_flat.shape[1]
+        for i in range(num_blocks):
+            start = i * block_size
+            end = min((i + 1) * block_size, n)
+            xi = x_flat[:, start:end]
+            width = end - start
+            if width < block_size:
+                xi = torch.nn.functional.pad(xi, (0, block_size - width))
+            existing[i].add_(xi.T @ xi)
 
     def _block_gram(self, x: torch.Tensor, block_size: int) -> List[torch.Tensor]:
         """Diagonal blocks of xᵀx.  Last block retains its true size (not zero-padded)."""
@@ -443,6 +594,7 @@ class ActivationStatsCollector:
         return blocks
 
     def _accumulate_amax(self, x_flat: torch.Tensor) -> None:
+        """Track running max |x| for this layer."""
         if not self.collect_amax:
             return
         amax_store = self.store.setdefault("amax", {})
@@ -470,9 +622,16 @@ class ActivationStatsCollector:
 
     # ---- hook entry point ------------------------------------------------
 
-    def _hook_fn(self, module: nn.Module, inputs) -> None:
-        # Pipeline: detach → flatten → float32 → NaN guard → rotate → accumulate.
-        # GPU-fast by default; force_cpu=True moves everything to CPU.
+    def _hook_fn(self, module: nn.Module, inputs: tuple) -> None:
+        """``forward_pre_hook``: detach, flatten, guard, rotate, accumulate.
+
+        This hook is side-effect-free with respect to *inputs* — it only
+        reads ``inputs[0]`` and never modifies the tensor.  All mutations
+        are to ``self.store``.
+
+        Pipeline: detach → flatten → float32 → NaN guard → rotate → accumulate.
+        GPU-fast by default; ``force_cpu=True`` moves everything to CPU.
+        """
         if not inputs:
             return
         x = inputs[0].detach()
@@ -496,7 +655,6 @@ class ActivationStatsCollector:
             return
 
         # Outlier guard: skip activations that would overflow float32 when squared.
-        _ACT_AMAX_CEILING = 1e6
         if x_flat.abs().max().item() > _ACT_AMAX_CEILING:
             self._nan_skip_count += 1
             return
@@ -531,8 +689,8 @@ class ActivationStatsCollector:
         self._accumulate_amax(x_flat)
 
 
-def _walk_target_modules(model: nn.Module) -> List[tuple]:
-    """Yield (name, module) for every Linear/Conv2d in ``model``."""
+def _walk_target_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
+    """Yield ``(name, module)`` for every Linear/Conv2d in *model*."""
     targets = []
     for name, module in model.named_modules():
         if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -542,7 +700,7 @@ def _walk_target_modules(model: nn.Module) -> List[tuple]:
 
 def _get_in_features(module: nn.Module, ltype: str) -> int:
     """Return the flattened input feature count for a target layer."""
-    if ltype == "Conv2d":
+    if ltype == _LAYER_TYPE_CONV2D:
         return module.in_channels * module.kernel_size[0] * module.kernel_size[1]
     return module.in_features
 
@@ -587,7 +745,7 @@ def _resolve_inner_model(model_patcher) -> nn.Module:
     return inner
 
 
-def _infer_latent_shape(model_patcher, height: int = 64, width: int = 64) -> tuple:
+def _infer_latent_shape(model_patcher, height: int = 64, width: int = 64) -> Tuple[int, int, int]:
     """Return ``(channels, H, W)`` for the calibration noise tensor."""
     inner = getattr(model_patcher, "model", None)
     if inner is None:
@@ -597,7 +755,7 @@ def _infer_latent_shape(model_patcher, height: int = 64, width: int = 64) -> tup
     return (int(channels), int(height), int(width))
 
 
-def _resolve_model_sampling(model_patcher):
+def _resolve_model_sampling(model_patcher) -> Optional[object]:
     """Return the model_sampling object, or None."""
     inner = getattr(model_patcher, "model", None)
     return getattr(inner, "model_sampling", None) if inner is not None else None
@@ -657,7 +815,16 @@ def _build_sigmas(model_sampling, num_steps: int,
 
 
 def _validate_hessians(hessians: Dict[str, torch.Tensor]) -> None:
-    """Check Hessians for corruption (extreme outliers, asymmetry). Logs warnings only."""
+    """Check Hessians for corruption (extreme outliers, asymmetry).
+
+    Logs warnings only — does not raise or modify the Hessians.
+    Three heuristics are applied:
+    1. Non-finite values or negative diagonal (DLR format).
+    2. Off-diagonal outlier: ``max_val / diag_max > _CORRUPTION_DIAG_RATIO``
+       when ``max_val > _CORRUPTION_MAX_VAL`` (full Hessian).
+    3. Asymmetry: ``sym_err > max_val * _CORRUPTION_SYM_RATIO``
+       when ``max_val > _CORRUPTION_MIN_MAG``.
+    """
     corrupted = []
     for name, H in hessians.items():
         if isinstance(H, dict) and H.get("format") == "dlr":
@@ -682,14 +849,15 @@ def _validate_hessians(hessians: Dict[str, torch.Tensor]) -> None:
             max_val = H.abs().max().item()
             diag_max = H.diagonal().abs().max().item()
 
-            # Off-diagonal > 1000× diagonal → outlier corruption
-            if max_val > 1e6 and diag_max > 0 and max_val / diag_max > 1e3:
+            # Off-diagonal > _CORRUPTION_DIAG_RATIO × diagonal → outlier corruption
+            if (max_val > _CORRUPTION_MAX_VAL and diag_max > 0
+                    and max_val / diag_max > _CORRUPTION_DIAG_RATIO):
                 corrupted.append(name)
                 logger.warning(
                     "Hessian corruption detected in %s: max=%.0f, diag_max=%.0f, ratio=%.0f",
                     name, max_val, diag_max, max_val / diag_max,
                 )
-            elif sym_err > max_val * 0.01 and max_val > 1e3:
+            elif sym_err > max_val * _CORRUPTION_SYM_RATIO and max_val > _CORRUPTION_MIN_MAG:
                 corrupted.append(name)
                 logger.warning(
                     "Hessian asymmetry detected in %s: sym_err=%.0f, max=%.0f",
@@ -702,7 +870,7 @@ def _validate_hessians(hessians: Dict[str, torch.Tensor]) -> None:
             for bi, block in enumerate(block_list):
                 sym_err = (block - block.T).abs().max().item()
                 max_val = block.abs().max().item()
-                if sym_err > max_val * 0.01 and max_val > 1e3:
+                if sym_err > max_val * _CORRUPTION_SYM_RATIO and max_val > _CORRUPTION_MIN_MAG:
                     corrupted.append(f"{name}[block {bi}]")
                     logger.warning(
                         "Hessian block asymmetry in %s block %d: sym_err=%.0f",
@@ -716,14 +884,15 @@ def _validate_hessians(hessians: Dict[str, torch.Tensor]) -> None:
         )
 
 
-def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
-                 latent_height, latent_width, progress_callback, pass_label="",
-                 sigma_min=0.0, sigma_max=1.0):
-    """Run the calibration sampling loop."""
-    t2 = time.time()
+def _run_samples(model_patcher, conditioning, num_steps: int, num_samples: int,
+                 seed: int, latent_height: int, latent_width: int,
+                 progress_callback: Optional[Callable[[int, int, str], None]],
+                 pass_label: str = "", sigma_min: float = 0.0,
+                 sigma_max: float = 1.0) -> None:
+    """Run the calibration sampling loop for a single model."""
+    setup_start = time.time()
     device = model_patcher.load_device
     dtype = torch.float32
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
     channels, lat_h, lat_w = _infer_latent_shape(model_patcher, latent_height, latent_width)
     batch = 1
 
@@ -731,12 +900,15 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
                            sigma_min=sigma_min, sigma_max=sigma_max).to(device)
     positive = conditioning
     negative = conditioning
-    logger.info("model setup (%s): %.2fs", pass_label, time.time() - t2)
+    logger.info("model setup (%s): %.2fs", pass_label, time.time() - setup_start)
 
     total = max(1, int(num_samples))
     overall_start = time.time()
     for sample_idx in range(total):
         sample_start = time.time()
+        # Re-seed per sample so each sample is independently reproducible
+        # (matches the dual-model seeding strategy).
+        generator = torch.Generator(device="cpu").manual_seed(int(seed) + sample_idx)
         noise = torch.randn(
             (batch, channels, lat_h, lat_w),
             generator=generator,
@@ -748,9 +920,9 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
                 model=model_patcher,
                 noise=noise,
                 steps=num_steps,
-                cfg=1.0,
-                sampler_name="euler",
-                scheduler="simple",
+                cfg=_DEFAULT_CFG,
+                sampler_name=_DEFAULT_SAMPLER,
+                scheduler=_DEFAULT_SCHEDULER,
                 positive=positive,
                 negative=negative,
                 latent_image=noise,
@@ -763,11 +935,8 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
             logger.exception("Sample %d/%d failed: %s", sample_idx + 1, total, exc)
             raise
 
-        elapsed = time.time() - sample_start
         done = sample_idx + 1
-        total_elapsed = time.time() - overall_start
-        avg = total_elapsed / done
-        remaining = avg * (total - done)
+        elapsed, avg, remaining = _compute_eta(done, total, sample_start, overall_start)
         msg = f"sample {done}/{total} ({_fmt_duration(elapsed)}, avg {_fmt_duration(avg)}, ETA {_fmt_duration(remaining)})"
         if progress_callback is not None:
             try:
@@ -776,7 +945,7 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
                 logger.debug("Progress callback error: %s", exc)
 
         # Periodically clear CUDA cache to prevent OOM during long runs
-        if (done % 4) == 0 and torch.cuda.is_available():
+        if (done % _CACHE_CLEAR_INTERVAL) == 0 and torch.cuda.is_available():
             comfy.model_management.soft_empty_cache()
 
     total_elapsed = time.time() - overall_start
@@ -784,7 +953,12 @@ def _run_samples(model_patcher, conditioning, num_steps, num_samples, seed,
 
 
 def _extract_hessian_diag(H) -> Optional[torch.Tensor]:
-    """Extract the diagonal from a Hessian (full, block-diagonal, or DLR)."""
+    """Extract the diagonal from a Hessian (full, block-diagonal, or DLR).
+
+    Returns a clone (float32) for DLR and contiguous tensors, or a new
+    concatenated tensor for block-diagonal formats.  Returns None when
+    the format is unrecognised.
+    """
     if isinstance(H, dict) and H.get("format") == "dlr":
         return H["D"].clone().float()
     if isinstance(H, list):
@@ -803,9 +977,7 @@ def _extract_hessian_diag(H) -> Optional[torch.Tensor]:
     return None
 
 
-
-
-# ── Refactored helpers shared by collect_stats and collect_stats_dual ───────
+# ── Helpers shared by collect_stats and collect_stats_dual ──────────────────
 
 
 def _allocate_layer_buffers(
@@ -822,7 +994,7 @@ def _allocate_layer_buffers(
     dlr_rank: int = 0,
     device: str = "cpu",
     force_cpu: bool = False,
-) -> tuple:
+) -> Tuple[List[ActivationStatsCollector], List[Tuple[str, nn.Module]], Dict, Dict]:
     """Walk target modules, allocate buffers, and register hooks.
 
     Returns ``(collectors, targets, shapes, layer_types)``.
@@ -840,7 +1012,7 @@ def _allocate_layer_buffers(
     collectors: List[ActivationStatsCollector] = []
 
     for idx, (name, module) in enumerate(targets, 1):
-        ltype = "Conv2d" if isinstance(module, nn.Conv2d) else "Linear"
+        ltype = _classify_layer(module)
         layer_types[name] = ltype
         shapes[name] = tuple(module.weight.shape)
 
@@ -851,12 +1023,11 @@ def _allocate_layer_buffers(
 
         if hessian_format == "dlr" and dlr_rank > 0:
             rank = min(dlr_rank, alloc_f)
-            sketch_size = 2 * rank + 4
             store["hessians"][name] = FrequentDirections(
-                n=alloc_f, sketch_size=sketch_size, rank=rank,
+                n=alloc_f, sketch_size=_dlr_sketch_size(rank), rank=rank,
                 device=hessian_device,
             )
-        elif hessian_block_size > 0 and alloc_f > hessian_block_size * 4:
+        elif hessian_format != "full" and hessian_block_size > 0 and alloc_f > hessian_block_size * _BLOCK_GRAM_MIN_FEATURES_RATIO:
             num_blocks = (alloc_f + hessian_block_size - 1) // hessian_block_size
             blocks = []
             for i in range(num_blocks):
@@ -902,6 +1073,250 @@ def _allocate_layer_buffers(
     return collectors, targets, shapes, layer_types
 
 
+# ── _finalize_store and its helpers ────────────────────────────────────────
+#
+# The ordering of these phases is critical:
+#   1. NaN-skip report   (read-only on collectors)
+#   2. Normalise         (mutates hessians)
+#   3. PermuQuant        (pops mu2, mutates hessians — must follow normalise)
+#   4. Validate          (read-only on hessians — must follow permuquant)
+#   5. PiSO diagonal     (read-only on hessians)
+#   6. Crop padding      (mutates hessians)
+#   7. Build result      (assembles final dict — needs all of the above)
+
+
+def _log_nan_skip_report(
+    collectors: List[ActivationStatsCollector],
+) -> Tuple[Dict[str, int], int, int]:
+    """Log and return NaN-skip statistics.
+
+    Returns ``(nan_skip_store, total_nan_skips, layers_with_skips)``.
+    """
+    nan_skip_store: Dict[str, int] = {}
+    total_nan_skips = 0
+    layers_with_skips = 0
+    for c in collectors:
+        if c._nan_skip_count > 0:
+            nan_skip_store[c.layer_name] = c._nan_skip_count
+            total_nan_skips += c._nan_skip_count
+            layers_with_skips += 1
+    if layers_with_skips > 0:
+        logger.warning(
+            "NaN/Inf detected in activations — skipped accumulation for "
+            "%d layer-passes across %d/%d layers.  The Hessian and amax "
+            "for affected layers reflect only the clean (finite) forward "
+            "passes.  Layers with most skips: %s",
+            total_nan_skips, layers_with_skips, len(collectors),
+            ", ".join(
+                f"{name} ({count})"
+                for name, count in sorted(
+                    nan_skip_store.items(), key=lambda x: -x[1]
+                )[:5]
+            ),
+        )
+    else:
+        logger.info("No NaN/Inf detected in any activations during calibration")
+    return nan_skip_store, total_nan_skips, layers_with_skips
+
+
+def _normalize_hessians_by_row_count(store: Dict) -> None:
+    """Divide each Hessian by its row count to produce a mean Gram matrix."""
+    row_counts = store.pop("_hessian_row_count", {})
+    hessians = store.get("hessians", {})
+    for name, H in hessians.items():
+        n = row_counts.get(name, 0)
+        if n <= 0:
+            continue
+        if isinstance(H, dict) and H.get("format") == "dlr":
+            H["D"].div_(n)
+            H["U"].div_(math.sqrt(n))
+        elif isinstance(H, list):
+            for block in H:
+                block.div_(n)
+        elif isinstance(H, torch.Tensor):
+            H.div_(n)
+    if row_counts:
+        logger.info(
+            "Normalised Hessians by row count (median rows=%d)",
+            sorted(row_counts.values())[len(row_counts) // 2],
+        )
+
+
+def _compute_permuquant_permutations(
+    store: Dict, shapes: Dict, layer_types: Dict,
+) -> Dict[str, torch.Tensor]:
+    """Compute channel permutations from second-moment statistics.
+
+    Pops ``mu2`` and ``_mu2_count`` from *store*.
+    """
+    mu2_store = store.pop("mu2", {})
+    count_store = store.pop("_mu2_count", {})
+    permutations: Dict[str, torch.Tensor] = {}
+    for name, mu2_sum in mu2_store.items():
+        n = count_store.get(name, 1)
+        mu2 = mu2_sum / n
+        shape = shapes[name]
+        ltype = layer_types[name]
+        if ltype == _LAYER_TYPE_CONV2D:
+            in_f = shape[1] * shape[2] * shape[3]
+        else:
+            in_f = shape[1]
+        mu2 = mu2[:in_f]
+        perm = mu2.argsort(descending=True).to(torch.int32)
+        permutations[name] = perm
+    logger.info("PermuQuant: computed permutations for %d layers", len(permutations))
+    return permutations
+
+
+def _apply_permuquant_to_hessians(store: Dict, permutations: Dict[str, torch.Tensor]) -> None:
+    """Apply channel permutations to Hessians in-place."""
+    hessians = store.get("hessians", {})
+    for name, perm in permutations.items():
+        if name in hessians:
+            old = hessians[name]
+            hessians[name] = permute_hessian(old, perm)
+            del old
+    gc.collect()
+    logger.info("PermuQuant: applied permutations to Hessians")
+
+
+def _extract_piso_diagonals(store: Dict) -> Dict[str, torch.Tensor]:
+    """Extract Hessian diagonals for PiSO data-aware scale optimization."""
+    hessian_diag_store: Dict[str, torch.Tensor] = {}
+    hessians = store.get("hessians", {})
+    for name, H in hessians.items():
+        diag = _extract_hessian_diag(H)
+        if diag is not None:
+            hessian_diag_store[name] = diag
+    logger.info("PiSO: extracted Hessian diagonal for %d layers", len(hessian_diag_store))
+    return hessian_diag_store
+
+
+def _crop_rotation_padding(
+    store: Dict, targets: List[Tuple[str, nn.Module]], rot_size: int,
+) -> None:
+    """Crop Hessians from padded size back to the layer's true in_features."""
+    if rot_size <= 0:
+        return
+    for name, module in targets:
+        ltype = _classify_layer(module)
+        in_f = _get_in_features(module, ltype)
+        H = store.get("hessians", {}).get(name)
+        if H is None:
+            continue
+        if isinstance(H, dict) and H.get("format") == "dlr":
+            if H["D"].shape[0] > in_f:
+                H["D"] = H["D"][:in_f].clone()
+                H["U"] = H["U"][:in_f].clone()
+                H["n"] = in_f
+        elif isinstance(H, list):
+            total = sum(b.shape[0] for b in H)
+            if total > in_f:
+                remaining = in_f
+                cropped = []
+                for b in H:
+                    bs = b.shape[0]
+                    if remaining >= bs:
+                        cropped.append(b)
+                        remaining -= bs
+                    elif remaining > 0:
+                        cropped.append(b[:remaining, :remaining])
+                        remaining = 0
+                store["hessians"][name] = cropped
+        elif isinstance(H, torch.Tensor):
+            if H.dim() == 2 and H.shape[0] > in_f:
+                store["hessians"][name] = H[:in_f, :in_f]
+            elif H.dim() == 3:
+                total = H.shape[0] * H.shape[1]
+                if total > in_f:
+                    bs = H.shape[1]
+                    num_full = in_f // bs
+                    remainder = in_f % bs
+                    blocks = [H[i] for i in range(num_full)]
+                    if remainder > 0:
+                        blocks.append(H[num_full][:remainder, :remainder])
+                    store["hessians"][name] = blocks
+
+
+def _build_result_metadata(
+    model_name: str,
+    num_samples: int,
+    num_steps: int,
+    seed: int,
+    hessian_block_size: int,
+    hessian_format: str,
+    dlr_rank: int,
+    collect_amax: bool,
+    rot_size: int,
+    permuquant: bool,
+    piso: bool,
+    hessian_diag_store: Dict[str, torch.Tensor],
+    sigma_min: float,
+    sigma_max: float,
+    targets: list,
+    latent_shape: Tuple[int, int, int],
+    layers_with_skips: int,
+    total_nan_skips: int,
+) -> Dict:
+    """Build the metadata dict for the calibration result."""
+    channels, lat_h, lat_w = latent_shape
+    return {
+        "model_name": model_name,
+        "num_samples": int(num_samples),
+        "num_steps": int(num_steps),
+        "seed": int(seed),
+        "hessian_block_size": int(hessian_block_size),
+        "hessian_format": hessian_format,
+        "dlr_rank": int(dlr_rank) if hessian_format == "dlr" else 0,
+        "collect_amax": bool(collect_amax),
+        "rot_size": int(rot_size),
+        "hessian_rotated": rot_size > 0,
+        "permuquant_enabled": permuquant,
+        "piso_enabled": piso and bool(hessian_diag_store),
+        "sigma_min": float(sigma_min),
+        "sigma_max": float(sigma_max),
+        "collection_date": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "recommended_damping_ratio": _RECOMMENDED_DAMPING_RATIO,
+        "quantization_order": "column",
+        "num_layers": len(targets),
+        "latent_shape": [int(channels), int(lat_h), int(lat_w)],
+        "nan_skip_layers": layers_with_skips,
+        "nan_skip_total": total_nan_skips,
+    }
+
+
+def _assemble_result(
+    store: Dict,
+    metadata: Dict,
+    shapes: Dict,
+    layer_types: Dict,
+    collect_amax: bool,
+    nan_skip_store: Dict[str, int],
+    permutations: Dict[str, torch.Tensor],
+    hessian_diag_store: Dict[str, torch.Tensor],
+    mmap_dir: Optional[str],
+) -> Dict:
+    """Assemble the final result dict from store contents and metadata."""
+    result = {
+        "metadata": metadata,
+        "hessians": store.get("hessians", {}),
+        "amax": store.get("amax", {}) if collect_amax else {},
+        "shapes": shapes,
+        "layer_types": layer_types,
+    }
+    if nan_skip_store:
+        result["nan_skips"] = nan_skip_store
+    if permutations:
+        result["permuquant"] = permutations
+    if hessian_diag_store:
+        result["hessian_diag"] = hessian_diag_store
+    if mmap_dir is not None:
+        result["_mmap_temp_dir"] = mmap_dir
+    return result
+
+
 def _finalize_store(
     store: Dict,
     collectors: List[ActivationStatsCollector],
@@ -929,181 +1344,52 @@ def _finalize_store(
 
     **Mutates** *store* (pops row counts and mu2).  Do not reuse the store
     after calling this function.
+
+    Phase ordering is documented at the module level above the helper
+    definitions and must be preserved.
     """
-    # ── NaN-skip report ──────────────────────────────────────────────
-    nan_skip_store: Dict[str, int] = {}
-    total_nan_skips = 0
-    layers_with_skips = 0
-    for c in collectors:
-        if c._nan_skip_count > 0:
-            nan_skip_store[c.layer_name] = c._nan_skip_count
-            total_nan_skips += c._nan_skip_count
-            layers_with_skips += 1
-    if layers_with_skips > 0:
-        logger.warning(
-            "NaN/Inf detected in activations — skipped accumulation for "
-            "%d layer-passes across %d/%d layers.  The Hessian and amax "
-            "for affected layers reflect only the clean (finite) forward "
-            "passes.  Layers with most skips: %s",
-            total_nan_skips, layers_with_skips, len(collectors),
-            ", ".join(
-                f"{name} ({count})"
-                for name, count in sorted(
-                    nan_skip_store.items(), key=lambda x: -x[1]
-                )[:5]
-            ),
-        )
-    else:
-        logger.info("No NaN/Inf detected in any activations during calibration")
+    # Phase 1: NaN-skip report
+    nan_skip_store, total_nan_skips, layers_with_skips = _log_nan_skip_report(collectors)
 
-    # ── Normalise Hessians by row count ──────────────────────────────
-    row_counts = store.pop("_hessian_row_count", {})
-    hessians = store.get("hessians", {})
-    for name, H in hessians.items():
-        n = row_counts.get(name, 0)
-        if n <= 0:
-            continue
-        if isinstance(H, dict) and H.get("format") == "dlr":
-            H["D"].div_(n)
-            H["U"].div_(math.sqrt(n))
-        elif isinstance(H, list):
-            for block in H:
-                block.div_(n)
-        elif isinstance(H, torch.Tensor):
-            H.div_(n)
-    if row_counts:
-        logger.info(
-            "Normalised Hessians by row count (median rows=%d)",
-            sorted(row_counts.values())[len(row_counts) // 2],
-        )
+    # Phase 2: Normalise Hessians by row count
+    _normalize_hessians_by_row_count(store)
 
-    # ── PermuQuant: compute permutations and apply to Hessians ──
+    # Phase 3: PermuQuant permutations (pops mu2, mutates hessians)
     permutations: Dict[str, torch.Tensor] = {}
     if permuquant:
-        mu2_store = store.pop("mu2", {})
-        count_store = store.pop("_mu2_count", {})
-        for name, mu2_sum in mu2_store.items():
-            n = count_store.get(name, 1)
-            mu2 = mu2_sum / n
-            shape = shapes[name]
-            ltype = layer_types[name]
-            if ltype == "Conv2d":
-                in_f = shape[1] * shape[2] * shape[3]
-            else:
-                in_f = shape[1]
-            mu2 = mu2[:in_f]
-            perm = mu2.argsort(descending=True).to(torch.int32)
-            permutations[name] = perm
-        logger.info("PermuQuant: computed permutations for %d layers", len(permutations))
+        permutations = _compute_permuquant_permutations(store, shapes, layer_types)
+        _apply_permuquant_to_hessians(store, permutations)
 
-        hessians = store.get("hessians", {})
-        for name, perm in permutations.items():
-            if name in hessians:
-                old = hessians[name]
-                hessians[name] = permute_hessian(old, perm)
-                del old
-        gc.collect()
-        logger.info("PermuQuant: applied permutations to Hessians")
-
-    # ── Validate Hessians ────────────────────────────────────────────
+    # Phase 4: Validate Hessians (read-only)
     _validate_hessians(store.get("hessians", {}))
 
-    # ── PiSO: extract Hessian diagonal ───────────────────────────────
+    # Phase 5: PiSO diagonal extraction (read-only)
     hessian_diag_store: Dict[str, torch.Tensor] = {}
     if piso:
-        hessians = store.get("hessians", {})
-        for name, H in hessians.items():
-            diag = _extract_hessian_diag(H)
-            if diag is not None:
-                hessian_diag_store[name] = diag
-        logger.info("PiSO: extracted Hessian diagonal for %d layers", len(hessian_diag_store))
+        hessian_diag_store = _extract_piso_diagonals(store)
 
-    # ── Crop rotation padding ────────────────────────────────────────
-    if rot_size > 0:
-        for name, module in targets:
-            ltype = "Conv2d" if isinstance(module, nn.Conv2d) else "Linear"
-            in_f = _get_in_features(module, ltype)
-            H = store.get("hessians", {}).get(name)
-            if H is None:
-                continue
-            if isinstance(H, dict) and H.get("format") == "dlr":
-                if H["D"].shape[0] > in_f:
-                    H["D"] = H["D"][:in_f].clone()
-                    H["U"] = H["U"][:in_f].clone()
-                    H["n"] = in_f
-            elif isinstance(H, list):
-                total = sum(b.shape[0] for b in H)
-                if total > in_f:
-                    remaining = in_f
-                    cropped = []
-                    for b in H:
-                        bs = b.shape[0]
-                        if remaining >= bs:
-                            cropped.append(b)
-                            remaining -= bs
-                        elif remaining > 0:
-                            cropped.append(b[:remaining, :remaining])
-                            remaining = 0
-                    store["hessians"][name] = cropped
-            elif isinstance(H, torch.Tensor):
-                if H.dim() == 2 and H.shape[0] > in_f:
-                    store["hessians"][name] = H[:in_f, :in_f]
-                elif H.dim() == 3:
-                    total = H.shape[0] * H.shape[1]
-                    if total > in_f:
-                        bs = H.shape[1]
-                        num_full = in_f // bs
-                        remainder = in_f % bs
-                        blocks = [H[i] for i in range(num_full)]
-                        if remainder > 0:
-                            blocks.append(H[num_full][:remainder, :remainder])
-                        store["hessians"][name] = blocks
+    # Phase 6: Crop rotation padding
+    _crop_rotation_padding(store, targets, rot_size)
 
-    # ── Build result dict ────────────────────────────────────────────
-    channels, lat_h, lat_w = latent_shape
+    # Phase 7: Build result dict
+    metadata = _build_result_metadata(
+        model_name=model_name, num_samples=num_samples, num_steps=num_steps,
+        seed=seed, hessian_block_size=hessian_block_size,
+        hessian_format=hessian_format, dlr_rank=dlr_rank,
+        collect_amax=collect_amax, rot_size=rot_size,
+        permuquant=permuquant, piso=piso,
+        hessian_diag_store=hessian_diag_store,
+        sigma_min=sigma_min, sigma_max=sigma_max,
+        targets=targets, latent_shape=latent_shape,
+        layers_with_skips=layers_with_skips, total_nan_skips=total_nan_skips,
+    )
 
-    metadata = {
-        "model_name": model_name,
-        "num_samples": int(num_samples),
-        "num_steps": int(num_steps),
-        "seed": int(seed),
-        "hessian_block_size": int(hessian_block_size),
-        "hessian_format": hessian_format,
-        "dlr_rank": int(dlr_rank) if hessian_format == "dlr" else 0,
-        "collect_amax": bool(collect_amax),
-        "rot_size": int(rot_size),
-        "hessian_rotated": rot_size > 0,
-        "permuquant_enabled": permuquant,
-        "piso_enabled": piso and bool(hessian_diag_store),
-        "sigma_min": float(sigma_min),
-        "sigma_max": float(sigma_max),
-        "collection_date": datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat().replace("+00:00", "Z"),
-        "recommended_damping_ratio": 0.01,
-        "quantization_order": "column",
-        "num_layers": len(targets),
-        "latent_shape": [int(channels), int(lat_h), int(lat_w)],
-        "nan_skip_layers": layers_with_skips,
-        "nan_skip_total": total_nan_skips,
-    }
-
-    result = {
-        "metadata": metadata,
-        "hessians": store.get("hessians", {}),
-        "amax": store.get("amax", {}) if collect_amax else {},
-        "shapes": shapes,
-        "layer_types": layer_types,
-    }
-    if nan_skip_store:
-        result["nan_skips"] = nan_skip_store
-    if permutations:
-        result["permuquant"] = permutations
-    if hessian_diag_store:
-        result["hessian_diag"] = hessian_diag_store
-    if mmap_dir is not None:
-        result["_mmap_temp_dir"] = mmap_dir
-    return result
+    return _assemble_result(
+        store=store, metadata=metadata, shapes=shapes, layer_types=layer_types,
+        collect_amax=collect_amax, nan_skip_store=nan_skip_store,
+        permutations=permutations, hessian_diag_store=hessian_diag_store,
+        mmap_dir=mmap_dir,
+    )
 
 
 def collect_stats(model_patcher,
@@ -1128,7 +1414,12 @@ def collect_stats(model_patcher,
     """Run partial denoising and collect per-layer activation statistics.
 
     Returns a dict with keys: ``metadata``, ``hessians``, ``amax``,
-    ``shapes``, ``layer_types``, and optionally ``permuquant``.
+    ``shapes``, ``layer_types``, and optionally ``permuquant``,
+    ``hessian_diag``, ``nan_skips``.
+
+    Side effects: writes a ``.pt`` file if *output_path* is given;
+    creates and cleans up a ``.gptq_hessian_tmp/`` directory for mmap mode.
+    No weights are modified.
     """
     if model_patcher is None:
         raise ValueError("model_patcher is required")
@@ -1139,6 +1430,7 @@ def collect_stats(model_patcher,
         raise ValueError("num_samples must be >= 1")
     if num_steps < 1:
         raise ValueError("num_steps must be >= 1")
+    # Early validation before allocation; also re-validated inside _build_sigmas.
     if sigma_min != 0.0 or sigma_max != 1.0:
         _validate_sigma_clip(sigma_min, sigma_max)
     if hessian_format == "dlr" and dlr_rank < 1:
@@ -1150,20 +1442,16 @@ def collect_stats(model_patcher,
     if collect_amax:
         store["amax"] = {}
 
-    use_mmap_full = (hessian_block_size == 0 and hessian_format != "dlr")
-    mmap_dir = None
+    use_mmap_full = hessian_format == "full" or (hessian_block_size == 0 and hessian_format != "dlr")
+    mmap_dir: Optional[str] = None
     if use_mmap_full:
-        if output_path:
-            base_dir = os.path.dirname(os.path.abspath(output_path))
-            mmap_dir = os.path.join(base_dir, ".gptq_hessian_tmp")
-        else:
-            mmap_dir = os.path.join(tempfile.gettempdir(), "gptq_hessian_tmp")
-        os.makedirs(mmap_dir, exist_ok=True)
+        mmap_dir = _resolve_mmap_dir(output_path)
         logger.info("Memory-mapping full Hessians to disk under %s", mmap_dir)
 
+    t_alloc = time.time()
     collectors, targets, shapes, layer_types = _allocate_layer_buffers(
         model_patcher, store, hessian_block_size, collect_amax, rot_size,
-        permuquant, mmap_dir, use_mmap_full,
+        permuquant, mmap_dir, use_mmap_full, alloc_start=t_alloc,
         hessian_format=hessian_format, dlr_rank=dlr_rank,
         device=str(model_patcher.load_device), force_cpu=force_cpu_hook,
     )
@@ -1191,7 +1479,15 @@ def collect_stats(model_patcher,
 
 
 class _DualModelGuider(comfy.samplers.CFGGuider):
-    """Calibration-only CFG guider routing positive/negative passes to separate models."""
+    """Calibration-only CFG guider routing positive/negative passes to separate models.
+
+    Private attributes set during :meth:`outer_sample`:
+
+    - ``uncond_inner``: the loaded negative-model inner guider (or None at CFG=1).
+    - ``uncond_loaded``: list of models loaded for the negative pass.
+    - ``_uncond_neg``: processed negative conditioning list.
+    - ``_uncond_conds``: resolved negative conditions for :meth:`predict_noise`.
+    """
 
     def __init__(self, model_patcher, uncond_model_patcher):
         super().__init__(model_patcher)
@@ -1287,11 +1583,16 @@ def collect_stats_dual(model_patcher,
                        piso: bool = False,
                        hessian_format: str = "block",
                        dlr_rank: int = 0,
-                       force_cpu_hook: bool = False) -> tuple:
+                       sigma_min: float = 0.0,
+                       sigma_max: float = 1.0,
+                       force_cpu_hook: bool = False) -> Tuple[Dict, Dict]:
     """Calibrate two models used together via dual-model CFG (e.g. Ideogram 4).
 
     Returns ``(result_positive, result_negative)`` in the same schema as
     ``collect_stats``.  Raises ``ValueError`` when *cfg == 1.0*.
+
+    Side effects: writes two ``.pt`` files; creates and cleans up
+    ``.gptq_hessian_tmp/`` directories for mmap mode.  No weights modified.
     """
     if model_patcher is None or model_negative_patcher is None:
         raise ValueError("Both model and model_negative are required")
@@ -1309,6 +1610,8 @@ def collect_stats_dual(model_patcher,
         raise ValueError("num_steps must be >= 1")
     if hessian_format == "dlr" and dlr_rank < 1:
         raise ValueError("dlr_rank must be >= 1 when hessian_format='dlr'")
+    if sigma_min != 0.0 or sigma_max != 1.0:
+        _validate_sigma_clip(sigma_min, sigma_max)
 
     # ── Allocate stores for both models ──────────────────────────────
     store_pos: Dict = {"hessians": {}}
@@ -1317,20 +1620,9 @@ def collect_stats_dual(model_patcher,
         store_pos["amax"] = {}
         store_neg["amax"] = {}
 
-    use_mmap_full = (hessian_block_size == 0 and hessian_format != "dlr")
-
-    def _resolve_mmap(base_path: Optional[str]) -> Optional[str]:
-        if not use_mmap_full:
-            return None
-        if base_path:
-            d = os.path.join(os.path.dirname(os.path.abspath(base_path)), ".gptq_hessian_tmp")
-        else:
-            d = os.path.join(tempfile.gettempdir(), "gptq_hessian_tmp")
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    mmap_dir_pos = _resolve_mmap(output_path_positive)
-    mmap_dir_neg = _resolve_mmap(output_path_negative)
+    use_mmap_full = hessian_format == "full" or (hessian_block_size == 0 and hessian_format != "dlr")
+    mmap_dir_pos = _resolve_mmap_dir(output_path_positive) if use_mmap_full else None
+    mmap_dir_neg = _resolve_mmap_dir(output_path_negative) if use_mmap_full else None
 
     t_alloc = time.time()
     collectors_pos, targets_pos, shapes_pos, types_pos = _allocate_layer_buffers(
@@ -1356,11 +1648,12 @@ def collect_stats_dual(model_patcher,
     guider.set_conds(positive, negative)
     guider.set_cfg(cfg)
 
-    sampler = comfy.samplers.sampler_object("euler")
-    sigmas = _build_sigmas(_resolve_model_sampling(model_patcher), num_steps)
+    sampler = comfy.samplers.sampler_object(_DEFAULT_SAMPLER)
+    sigmas = _build_sigmas(_resolve_model_sampling(model_patcher), num_steps,
+                           sigma_min=sigma_min, sigma_max=sigma_max)
     sigmas = sigmas.to(model_patcher.load_device)
 
-    progress = comfy.utils.ProgressBar(num_samples) if progress_callback is None else None
+    fallback_pbar = comfy.utils.ProgressBar(num_samples) if progress_callback is None else None
     overall_start = time.time()
 
     for sample_idx in range(max(1, num_samples)):
@@ -1379,22 +1672,19 @@ def collect_stats_dual(model_patcher,
             logger.exception("Dual sample %d/%d failed: %s", sample_idx + 1, num_samples, exc)
             raise
 
-        elapsed = time.time() - sample_start
         done = sample_idx + 1
-        total_elapsed = time.time() - overall_start
-        avg = total_elapsed / done
-        remaining = avg * (num_samples - done)
+        elapsed, avg, remaining = _compute_eta(done, num_samples, sample_start, overall_start)
         msg = f"sample {done}/{num_samples} ({_fmt_duration(elapsed)}, avg {_fmt_duration(avg)}, ETA {_fmt_duration(remaining)})"
         if progress_callback is not None:
             try:
                 progress_callback(done, num_samples, msg)
             except Exception:
                 pass
-        if progress is not None:
-            progress.update_absolute(done, num_samples)
+        if fallback_pbar is not None:
+            fallback_pbar.update_absolute(done, num_samples)
         logger.info("Dual calibration: %s", msg)
 
-        if (done % 4) == 0 and torch.cuda.is_available():
+        if (done % _CACHE_CLEAR_INTERVAL) == 0 and torch.cuda.is_available():
             comfy.model_management.soft_empty_cache()
 
     total_elapsed = time.time() - overall_start
@@ -1417,6 +1707,7 @@ def collect_stats_dual(model_patcher,
         num_samples=num_samples, num_steps=num_steps, seed=seed,
         latent_shape=latent_shape, mmap_dir=mmap_dir_pos,
         hessian_format=hessian_format, dlr_rank=dlr_rank,
+        sigma_min=sigma_min, sigma_max=sigma_max,
     )
     result_neg = _finalize_store(
         store=store_neg, collectors=collectors_neg, targets=targets_neg,
@@ -1427,6 +1718,7 @@ def collect_stats_dual(model_patcher,
         num_samples=num_samples, num_steps=num_steps, seed=seed,
         latent_shape=latent_shape, mmap_dir=mmap_dir_neg,
         hessian_format=hessian_format, dlr_rank=dlr_rank,
+        sigma_min=sigma_min, sigma_max=sigma_max,
     )
 
     result_pos["metadata"]["dual_model"] = True
@@ -1440,6 +1732,7 @@ def collect_stats_dual(model_patcher,
 
 
 def _guess_model_name(model_patcher) -> str:
+    """Return a human-readable model name derived from the patcher's class hierarchy."""
     inner = getattr(model_patcher, "model", None)
     if inner is None:
         return "unknown"

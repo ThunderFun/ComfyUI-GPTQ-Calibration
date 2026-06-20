@@ -1,12 +1,22 @@
+"""Utility functions for calibration data I/O and size estimation."""
 import logging
 import os
+from typing import Dict, Tuple
 
 import torch
 
 logger = logging.getLogger("comfyui_gptq_calibration")
 
+__all__ = [
+    "default_dual_output_paths",
+    "save_calibration",
+    "load_calibration",
+    "estimate_disk_size",
+    "human_size",
+]
 
-def default_dual_output_paths(base_path: str | None = None) -> tuple[str, str]:
+
+def default_dual_output_paths(base_path: str | None = None) -> Tuple[str, str]:
     """Derive ``<base>_positive.pt`` and ``<base>_negative.pt`` output paths.
 
     If *base_path* is ``None``, uses the ComfyUI output directory.
@@ -41,7 +51,7 @@ def save_calibration(data: dict, path: str) -> str:
     """Save calibration data to a .pt file.
 
     The directory is created if it does not exist. The path is returned
-    so callers can chain a (path,) tuple back to ComfyUI.
+    so callers can chain a ``(path,)`` tuple back to ComfyUI.
     """
     directory = os.path.dirname(os.path.abspath(path))
     if directory and not os.path.isdir(directory):
@@ -51,7 +61,11 @@ def save_calibration(data: dict, path: str) -> str:
 
 
 def load_calibration(path: str) -> dict:
-    """Load calibration data from a .pt file (CPU, weights_only=True)."""
+    """Load calibration data from a .pt file (CPU, ``weights_only=True``).
+
+    ``weights_only=True`` is a security measure that prevents arbitrary code
+    execution when loading untrusted ``.pt`` files.
+    """
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
@@ -61,8 +75,13 @@ def estimate_disk_size(num_layers: int,
                        collect_amax: bool = True,
                        dtype_bytes: int = 4,
                        hessian_format: str = "block",
-                       dlr_rank: int = 0) -> dict:
-    """Estimate output file size. Returns dict with hessian_bytes, amax_bytes, total_bytes, total_gb."""
+                       dlr_rank: int = 0) -> Dict[str, float]:
+    """Estimate output file size.
+
+    ``dtype_bytes`` defaults to 4 (float32).  Returns a dict with keys:
+    ``hessian_bytes``, ``amax_bytes``, ``total_bytes``, ``total_gb``
+    (using ``1024**3``, not ``1e9``), and ``per_layer_bytes``.
+    """
     if hessian_format == "dlr" and dlr_rank > 0:
         rank = min(dlr_rank, avg_in_features)
         # DLR stores D (n floats) + U (n * rank floats)
@@ -87,7 +106,7 @@ def estimate_disk_size(num_layers: int,
 
 
 def human_size(num_bytes: int) -> str:
-    """Format a byte count as a human-readable string."""
+    """Format a byte count as a human-readable string (B/KB/MB/GB/TB/PB)."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if num_bytes < 1024.0:
             return f"{num_bytes:.2f} {unit}"

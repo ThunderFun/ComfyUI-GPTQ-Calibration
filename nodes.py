@@ -1,6 +1,12 @@
+"""ComfyUI node definitions for calibration data collection.
+
+Exports ``NODE_CLASS_MAPPINGS`` and ``NODE_DISPLAY_NAME_MAPPINGS`` for
+ComfyUI's node loader.  No weights are modified.
+"""
 import logging
 import os
 import shutil
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -19,8 +25,22 @@ except ImportError:
 
 logger = logging.getLogger("comfyui_gptq_calibration")
 
+__all__ = [
+    "CalibrationDataCollector",
+    "DualModelCalibrationDataCollector",
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+]
+
+# Maximum seed value (32-bit unsigned max; matches ComfyUI's seed convention).
+_MAX_SEED: int = 0xFFFFFFFF
+
+
+# ── Shared helpers ─────────────────────────────────────────────────────────
+
 
 def _default_output_path() -> str:
+    """Return the default calibration output path in ComfyUI's output directory."""
     base = folder_paths.get_output_directory() if hasattr(folder_paths, "get_output_directory") else folder_paths.output_directory
     return os.path.join(base, "calibration.pt")
 
@@ -36,10 +56,70 @@ def _normalize_conditioning(conditioning) -> list:
     return conditioning
 
 
+def _extract_layer_stats(data: Dict) -> Tuple[int, int]:
+    """Extract ``(num_layers, avg_in_features)`` from calibration result data."""
+    try:
+        num_layers = int(data["metadata"]["num_layers"])
+    except Exception:
+        num_layers = len(data.get("shapes", {}))
+    try:
+        shapes = data.get("shapes", {})
+        def _in_features(s):
+            # Conv2d weight: (out_ch, in_ch, kH, kW) → in_ch * kH * kW
+            # Linear weight: (out_features, in_features) → in_features
+            if len(s) == 4:
+                return s[1] * s[2] * s[3]
+            return s[1] if len(s) > 1 else s[0]
+        avg_in = int(sum(_in_features(s) for s in shapes.values()) / max(1, len(shapes)))
+    except Exception:
+        avg_in = 0
+    return num_layers, avg_in
+
+
+def _log_disk_estimate(data: Dict, hessian_block_size: int, collect_amax: bool,
+                       hessian_format: str, dlr_rank: int, label: str = "") -> None:
+    """Log the estimated calibration file size for *data*."""
+    num_layers, avg_in = _extract_layer_stats(data)
+    estimate = estimate_disk_size(num_layers, avg_in, hessian_block_size, collect_amax,
+                                  hessian_format=hessian_format, dlr_rank=dlr_rank)
+    logger.info(
+        "Estimated calibration file size (%s): %s (Hessian %s, amax %s) for %d layers, avg in_features=%d",
+        label,
+        human_size(estimate["total_bytes"]),
+        human_size(estimate["hessian_bytes"]),
+        human_size(estimate["amax_bytes"]),
+        num_layers,
+        avg_in,
+    )
+
+
+def _cleanup_mmap_dir(data: Dict) -> None:
+    """Remove the temporary mmap directory referenced by *data*, if any."""
+    mmap_dir = data.pop("_mmap_temp_dir", None)
+    if mmap_dir and os.path.isdir(mmap_dir):
+        shutil.rmtree(mmap_dir, ignore_errors=True)
+        logger.info("Cleaned up temporary Hessian mmap directory %s", mmap_dir)
+
+
+def _make_progress_callback(label: str):
+    """Return a progress callback that logs with the given *label* prefix."""
+    def _cb(done, total, msg):
+        logger.info("%s: %s", label, msg)
+    return _cb
+
+
+# ── Node definitions ───────────────────────────────────────────────────────
+
 
 class CalibrationDataCollector(ComfyNodeABC):
     """Collect per-layer Hessians and amax from a loaded diffusion model.
+
     Output is a ``.pt`` file for external quantizers (GPTQ/OBQ/ConvRot).
+    No weights are modified.  The ``collect`` method is the ComfyUI entry
+    point (set via ``FUNCTION = "collect"``).
+
+    Side effects: writes a ``.pt`` file to *output_path*; creates and
+    cleans up a ``.gptq_hessian_tmp/`` directory for mmap mode.
     """
 
     DESCRIPTION = (
@@ -53,6 +133,7 @@ class CalibrationDataCollector(ComfyNodeABC):
     OUTPUT_NODE = True
 
     @classmethod
+    # ``s`` is the node class per ComfyUI's convention for INPUT_TYPES.
     def INPUT_TYPES(s) -> InputTypeDict:
         return {
             "required": {
@@ -60,9 +141,9 @@ class CalibrationDataCollector(ComfyNodeABC):
                 "conditioning": (IO.CONDITIONING, {"tooltip": "Pre-encoded conditioning from CLIPTextEncode or similar."}),
                 "num_steps": (IO.INT, {"default": 4, "min": 1, "max": 50, "tooltip": "Denoising steps per sample."}),
                 "num_samples": (IO.INT, {"default": 16, "min": 1, "max": 4096, "tooltip": "Independent samples to accumulate over. 16-128 recommended."}),
-                "seed": (IO.INT, {"default": 0, "min": 0, "max": 0xFFFFFFFF, "tooltip": "Seed for noise and timestep sampling."}),
+                "seed": (IO.INT, {"default": 0, "min": 0, "max": _MAX_SEED, "tooltip": "Seed for noise and timestep sampling."}),
                 "hessian_block_size": (IO.INT, {"default": 128, "min": 0, "max": 1024, "tooltip": "0 = full H (paper-accurate, auto memory-mapped to disk). 128 = diagonal blocks (default, saves RAM). Ignored when hessian_format='dlr'."}),
-                "hessian_format": (IO.COMBO, {"default": "dlr", "options": ["block", "full", "dlr"], "tooltip": "Hessian storage format. 'block' = diagonal blocks (use hessian_block_size). 'full' = full Hessian (memory-mapped). 'dlr' = Diagonal + Low-Rank via Frequent Directions (same memory as block, captures cross-block correlations). Recommended default."}),
+                "hessian_format": ("COMBO", {"options": ["block", "full", "dlr"], "default": "dlr", "tooltip": "Hessian storage format. 'block' = diagonal blocks (use hessian_block_size). 'full' = full Hessian (memory-mapped). 'dlr' = Diagonal + Low-Rank via Frequent Directions (same memory as block, captures cross-block correlations). Recommended default."}),
                 "dlr_rank": (IO.INT, {"default": 128, "min": 1, "max": 4096, "tooltip": "Rank for DLR Hessian (only used when hessian_format='dlr'). Same memory budget as block_size=rank. Recommended: 64-256."}),
                 "collect_amax": (IO.BOOLEAN, {"default": True, "tooltip": "Also collect max(abs(x)) per layer. Required for activation quantization; not used by weight-only GPTQ."}),
                 "output_path": (IO.STRING, {"default": _default_output_path(), "tooltip": "Where to save the calibration .pt file."}),
@@ -99,7 +180,11 @@ class CalibrationDataCollector(ComfyNodeABC):
                 piso: bool = False,
                 sigma_min: float = 0.0,
                 sigma_max: float = 1.0,
-                force_cpu_hook: bool = False) -> tuple:
+                force_cpu_hook: bool = False) -> Tuple[str]:
+        """Collect calibration data and save to ``output_path``.
+
+        Returns ``(calibration_path,)`` for ComfyUI output routing.
+        """
         cond = _normalize_conditioning(conditioning)
         if not cond:
             raise ValueError("conditioning is empty")
@@ -132,32 +217,13 @@ class CalibrationDataCollector(ComfyNodeABC):
         )
 
         try:
-            num_layers = int(data["metadata"]["num_layers"])
-        except Exception:
-            num_layers = len(data.get("shapes", {}))
-        try:
-            shapes = data.get("shapes", {})
-            avg_in = int(sum(s[1] if len(s) > 1 else s[0] for s in shapes.values()) / max(1, len(shapes)))
-        except Exception:
-            avg_in = 0
-        estimate = estimate_disk_size(num_layers, avg_in, hessian_block_size, collect_amax,
-                                      hessian_format=hessian_format, dlr_rank=dlr_rank)
-        logger.info(
-            "Estimated calibration file size: %s (Hessian %s, amax %s) for %d layers, avg in_features=%d",
-            human_size(estimate["total_bytes"]),
-            human_size(estimate["hessian_bytes"]),
-            human_size(estimate["amax_bytes"]),
-            num_layers,
-            avg_in,
-        )
+            _log_disk_estimate(data, hessian_block_size, collect_amax,
+                               hessian_format, dlr_rank, label=output_path)
 
-        path = save_calibration(data, output_path)
-        logger.info("Calibration data written to %s", path)
-
-        mmap_dir = data.pop("_mmap_temp_dir", None)
-        if mmap_dir and os.path.isdir(mmap_dir):
-            shutil.rmtree(mmap_dir, ignore_errors=True)
-            logger.info("Cleaned up temporary Hessian mmap directory %s", mmap_dir)
+            path = save_calibration(data, output_path)
+            logger.info("Calibration data written to %s", path)
+        finally:
+            _cleanup_mmap_dir(data)
 
         progress.update_absolute(num_samples, num_samples)
         return (path,)
@@ -195,6 +261,9 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
 
     Outputs two ``.pt`` files — one per model — each in the same schema as
     the single-model ``CalibrationDataCollector`` output.
+
+    Side effects: writes two ``.pt`` files; creates and cleans up
+    ``.gptq_hessian_tmp/`` directories for mmap mode.  No weights modified.
     """
 
     DESCRIPTION = (
@@ -208,6 +277,7 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
     OUTPUT_NODE = True
 
     @classmethod
+    # ``s`` is the node class per ComfyUI's convention for INPUT_TYPES.
     def INPUT_TYPES(s) -> InputTypeDict:
         return {
             "required": {
@@ -218,9 +288,9 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
                 "cfg": (IO.FLOAT, {"default": 4.0, "min": 1.01, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "CFG value to apply between the two models. Must be > 1.0 to calibrate both models."}),
                 "num_steps": (IO.INT, {"default": 4, "min": 1, "max": 50}),
                 "num_samples": (IO.INT, {"default": 16, "min": 1, "max": 4096}),
-                "seed": (IO.INT, {"default": 0, "min": 0, "max": 0xFFFFFFFF}),
+                "seed": (IO.INT, {"default": 0, "min": 0, "max": _MAX_SEED}),
                 "hessian_block_size": (IO.INT, {"default": 128, "min": 0, "max": 1024, "tooltip": "0 = full Hessian, 128 = diagonal blocks. Ignored when hessian_format='dlr'."}),
-                "hessian_format": (IO.COMBO, {"default": "dlr", "options": ["block", "full", "dlr"], "tooltip": "Hessian storage format. 'dlr' = Diagonal + Low-Rank (same memory as block, captures cross-block correlations). Recommended default."}),
+                "hessian_format": ("COMBO", {"options": ["block", "full", "dlr"], "default": "dlr", "tooltip": "Hessian storage format. 'dlr' = Diagonal + Low-Rank (same memory as block, captures cross-block correlations). Recommended default."}),
                 "dlr_rank": (IO.INT, {"default": 128, "min": 1, "max": 4096, "tooltip": "Rank for DLR Hessian (only used when hessian_format='dlr')."}),
                 "collect_amax": (IO.BOOLEAN, {"default": True}),
                 "output_path_positive": (IO.STRING, {"default": _default_dual_positive_path(), "tooltip": "Where to save the positive model's calibration .pt file."}),
@@ -233,6 +303,8 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
                 "rot_size": (IO.INT, {"default": 256, "min": 16, "max": 4096}),
                 "permuquant": (IO.BOOLEAN, {"default": False}),
                 "piso": (IO.BOOLEAN, {"default": False}),
+                "sigma_min": (IO.FLOAT, {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "Lower bound of the sigma range to sample. Set to 0.875 with Wan 2.2 high-noise expert, or 0.0 for full range (default)."}),
+                "sigma_max": (IO.FLOAT, {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "Upper bound of the sigma range to sample. Set to 0.875 with Wan 2.2 low-noise expert, or 1.0 for full range (default)."}),
                 "force_cpu_hook": (IO.BOOLEAN, {"default": False, "tooltip": "Force hook-side processing to CPU. Enable if you hit GPU OOM with dual-model calibration."}),
             },
         }
@@ -258,7 +330,14 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
                 rot_size: int = 256,
                 permuquant: bool = False,
                 piso: bool = False,
-                force_cpu_hook: bool = False) -> tuple:
+                sigma_min: float = 0.0,
+                sigma_max: float = 1.0,
+                force_cpu_hook: bool = False) -> Tuple[str, str]:
+        """Collect calibration data for both models and save to their paths.
+
+        Returns ``(calibration_path_positive, calibration_path_negative)``
+        for ComfyUI output routing.
+        """
         # Resolve negative: None → [[None, {}]] (image-only)
         neg = _normalize_dual_negative(negative)
         pos = _normalize_conditioning(positive)
@@ -297,35 +376,23 @@ class DualModelCalibrationDataCollector(ComfyNodeABC):
             piso=piso,
             hessian_format=hessian_format,
             dlr_rank=dlr_rank,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
             force_cpu_hook=force_cpu_hook,
         )
 
-        path_pos = save_calibration(data_pos, output_path_positive)
-        path_neg = save_calibration(data_neg, output_path_negative)
-        logger.info("Dual calibration written to %s and %s", path_pos, path_neg)
+        try:
+            path_pos = save_calibration(data_pos, output_path_positive)
+            path_neg = save_calibration(data_neg, output_path_negative)
+            logger.info("Dual calibration written to %s and %s", path_pos, path_neg)
 
-        for data, path in ((data_pos, path_pos), (data_neg, path_neg)):
-            try:
-                num_layers = int(data["metadata"]["num_layers"])
-            except Exception:
-                num_layers = len(data.get("shapes", {}))
-            try:
-                shapes = data.get("shapes", {})
-                avg_in = int(sum(s[1] if len(s) > 1 else s[0] for s in shapes.values()) / max(1, len(shapes)))
-            except Exception:
-                avg_in = 0
-            estimate = estimate_disk_size(num_layers, avg_in, hessian_block_size, collect_amax,
-                                          hessian_format=hessian_format, dlr_rank=dlr_rank)
-            logger.info(
-                "Estimated size (%s): %s for %d layers",
-                path, human_size(estimate["total_bytes"]), num_layers,
-            )
-
-        for data in (data_pos, data_neg):
-            mmap_dir = data.pop("_mmap_temp_dir", None)
-            if mmap_dir and os.path.isdir(mmap_dir):
-                shutil.rmtree(mmap_dir, ignore_errors=True)
-                logger.info("Cleaned up temporary mmap directory %s", mmap_dir)
+            _log_disk_estimate(data_pos, hessian_block_size, collect_amax,
+                               hessian_format, dlr_rank, label=path_pos)
+            _log_disk_estimate(data_neg, hessian_block_size, collect_amax,
+                               hessian_format, dlr_rank, label=path_neg)
+        finally:
+            for data in (data_pos, data_neg):
+                _cleanup_mmap_dir(data)
 
         progress.update_absolute(num_samples, num_samples)
         return (path_pos, path_neg)

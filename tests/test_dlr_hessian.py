@@ -114,7 +114,7 @@ def _gptq_step_dlr(D: torch.Tensor, U: torch.Tensor,
 
     # Propagate error: W[:, col_idx+1:] -= error * H[col_idx, col_idx+1:] / H[col_idx, col_idx]
     # (We don't modify W here — that's the caller's job. We just zero the column.)
-    _ = error  # unused in this simplified version
+    _ = error  # Full GPTQ propagates `error` to remaining columns; omitted here for test simplicity.
 
     # Zero out col_idx
     D_new = D.clone()

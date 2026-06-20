@@ -1,7 +1,14 @@
 """FHT rotation kernels — O(N log N) Fast Hadamard Transform.
 
-Drop-in replacement for the O(N²) matmul-based rotate_activations() in
-calibration.py.  Two variants: Regular (power-of-4) and Sylvester (any power-of-2).
+Drop-in replacement for the O(N²) matmul-based ``rotate_activations()`` in
+``calibration.py``.  Two variants are provided: Regular (power-of-4) and
+Sylvester (any power-of-2).
+
+Reference CPU implementations (``_is_power_of_four``, ``_get_hadamard``,
+``_rotate_activations_cpu``) are deliberately duplicated from
+``calibration.py`` to keep this module dependency-free (no ``comfy.*``
+import).  This allows the kernel module and its tests to run in isolation
+without ComfyUI stubs.
 """
 
 import math
@@ -15,18 +22,33 @@ try:
 except ImportError:
     _HAS_TRITON = False
 
+__all__ = ["fht_rotate", "_HAS_TRITON"]
+
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-# Max rows per kernel launch — keeps tmp buffer memory bounded.
-# With BLOCK_K=256: 2048 × 256 × 4 × 2 = 4 MiB per chunk.
+# Maximum number of rows processed per kernel invocation.  Bounds the
+# temporary buffer memory: with BLOCK_K=256 the scratch allocation is
+# 2048 × 256 × 4 bytes × 2 buffers = 4 MiB per chunk.
 _CHUNK_ROWS = 2048
 
-# 1/sqrt(2) as a constant for the Sylvester butterfly.
-_INV_SQRT2 = 0.7071067811865476
+# Bitmask with 1-bits at even bit positions (0, 2, 4, …).  A power of 4
+# has exactly one set bit at an even position, so the identity
+# ``(n & _POWER_OF_FOUR_BITMASK) == n`` holds if and only if *n* is a
+# power of 4.
+_POWER_OF_FOUR_BITMASK = 0x55555555
 
 
 # ── Regular Hadamard FHT kernel (power-of-4) ───────────────────────────────
+
+# Implementation note: each butterfly stage must be fully unrolled because
+# Triton requires ``tl.constexpr`` strides (compile-time constants).  The
+# stride for stage *i* is ``4**i`` (Regular) or ``2**i`` (Sylvester).  A
+# double-buffered scratch pattern (tmp_a / tmp_b) is used; after all stages
+# the result resides in tmp_a when NUM_STAGES is even, tmp_b when odd.
+#
+# The 4-element (Regular) butterfly applies the matrix H₄ / 2:
+#   (a+b+c−d)/2, (a+b−c+d)/2, (a−b+c+d)/2, (−a+b+c+d)/2
 
 if _HAS_TRITON:
 
@@ -39,11 +61,11 @@ if _HAS_TRITON:
         BLOCK_K: tl.constexpr,
         NUM_CHUNKS: tl.constexpr,
     ):
-        """Group-wise Regular Hadamard FHT — power-of-4 rot_sizes.
+        """Group-wise Regular Hadamard FHT for power-of-4 ``rot_size``.
 
-        Each program processes one row divided into NUM_CHUNKS groups of
-        BLOCK_K features.  Tmp buffers use local indices so each chunk
-        reuses the same scratch space.
+        Each program processes one row divided into ``NUM_CHUNKS`` groups of
+        ``BLOCK_K`` features.  Temporary buffers use local (within-group)
+        indices so that each chunk reuses the same scratch space.
         """
         pid = tl.program_id(axis=0)
         x_base = x_ptr + pid * stride_xm
@@ -57,12 +79,12 @@ if _HAS_TRITON:
             cols = g + offs
             mask = cols < K
 
-            # Load chunk from x (global index), store to tmp (local index)
+            # Read current chunk from global memory into scratch buffer.
             vals = tl.load(x_base + cols, mask=mask, other=0.0).to(tl.float32)
             tl.store(tmp_a_row + offs, vals, mask=mask)
             tl.debug_barrier()
 
-            # Stage 0 (s=1): tmp_a → tmp_b
+            # Stage 0 (stride 1): tmp_a → tmp_b
             sub = (offs // 1) % 4
             base = offs - sub
             a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -80,7 +102,7 @@ if _HAS_TRITON:
             tl.debug_barrier()
 
             if NUM_STAGES > 1:
-                # Stage 1 (s=4): tmp_b → tmp_a
+                # Stage 1 (stride 4): tmp_b → tmp_a
                 sub = (offs // 4) % 4
                 base = offs - sub * 4
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -98,7 +120,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 2:
-                # Stage 2 (s=16): tmp_a → tmp_b
+                # Stage 2 (stride 16): tmp_a → tmp_b
                 sub = (offs // 16) % 4
                 base = offs - sub * 16
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -116,7 +138,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 3:
-                # Stage 3 (s=64): tmp_b → tmp_a
+                # Stage 3 (stride 64): tmp_b → tmp_a
                 sub = (offs // 64) % 4
                 base = offs - sub * 64
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -134,7 +156,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 4:
-                # Stage 4 (s=256): tmp_a → tmp_b
+                # Stage 4 (stride 256): tmp_a → tmp_b
                 sub = (offs // 256) % 4
                 base = offs - sub * 256
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -152,7 +174,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 5:
-                # Stage 5 (s=1024): tmp_b → tmp_a
+                # Stage 5 (stride 1024): tmp_b → tmp_a
                 sub = (offs // 1024) % 4
                 base = offs - sub * 1024
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -169,17 +191,21 @@ if _HAS_TRITON:
                 tl.store(tmp_a_row + offs, result, mask=mask)
                 tl.debug_barrier()
 
-            # Final result is in tmp_a if NUM_STAGES is even, tmp_b if odd
+            # Result resides in tmp_a when NUM_STAGES is even, tmp_b when odd.
             if NUM_STAGES % 2 == 0:
                 final = tl.load(tmp_a_row + offs, mask=mask, other=0.0)
             else:
                 final = tl.load(tmp_b_row + offs, mask=mask, other=0.0)
 
-            # Store to output using global index
+            # Write result back to global output at the original column indices.
             tl.store(out_base + cols, final, mask=mask)
 
 
 # ── Sylvester Hadamard FHT kernel (any power-of-2) ─────────────────────────
+
+# Same stage-unrolling constraint as the Regular kernel (see above).
+# The 2-element Sylvester butterfly: (a+b)/√2, (a-b)/√2.
+# Stride doubles at each successive stage.
 
 if _HAS_TRITON:
 
@@ -192,10 +218,10 @@ if _HAS_TRITON:
         BLOCK_K: tl.constexpr,
         NUM_CHUNKS: tl.constexpr,
     ):
-        """Group-wise Sylvester Hadamard FHT — any power-of-2 rot_size.
+        """Group-wise Sylvester Hadamard FHT for any power-of-2 ``rot_size``.
 
-        Each program processes one row divided into NUM_CHUNKS groups of
-        BLOCK_K features.  Uses the 2-element butterfly: (a ± b) / √2.
+        Each program processes one row divided into ``NUM_CHUNKS`` groups of
+        ``BLOCK_K`` features.  Uses the 2-element butterfly: (a ± b) / √2.
         """
         pid = tl.program_id(axis=0)
         x_base = x_ptr + pid * stride_xm
@@ -211,20 +237,16 @@ if _HAS_TRITON:
             cols = g + offs
             mask = cols < K
 
-            # Load chunk from x (global index), store to tmp (local index)
+            # Read current chunk from global memory into scratch buffer.
             vals = tl.load(x_base + cols, mask=mask, other=0.0).to(tl.float32)
             tl.store(tmp_a_row + offs, vals, mask=mask)
             tl.debug_barrier()
 
-            # Apply NUM_STAGES butterfly stages, alternating tmp_a ↔ tmp_b.
-            # Stage 0 (stride=1): pairs (0,1), (2,3), ...
-            # Stage 1 (stride=2): pairs (0,2), (1,3), (4,6), ...
-            # Stage 2 (stride=4): pairs (0,4), (1,5), (2,6), ...
-            # ...
-            # Stage i (stride=2^i): pairs within groups of 2^{i+1}
+            # Butterfly stages alternate between tmp_a and tmp_b.
+            # Stage i pairs elements at stride 2^i within groups of 2^(i+1).
 
             if NUM_STAGES > 0:
-                # Stage 0 (stride=1): tmp_a → tmp_b
+                # Stage 0 (stride 1): tmp_a → tmp_b
                 sub = (offs // 1) % 2
                 base = offs - sub
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -236,7 +258,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 1:
-                # Stage 1 (stride=2): tmp_b → tmp_a
+                # Stage 1 (stride 2): tmp_b → tmp_a
                 sub = (offs // 2) % 2
                 base = offs - sub * 2
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -248,7 +270,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 2:
-                # Stage 2 (stride=4): tmp_a → tmp_b
+                # Stage 2 (stride 4): tmp_a → tmp_b
                 sub = (offs // 4) % 2
                 base = offs - sub * 4
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -260,7 +282,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 3:
-                # Stage 3 (stride=8): tmp_b → tmp_a
+                # Stage 3 (stride 8): tmp_b → tmp_a
                 sub = (offs // 8) % 2
                 base = offs - sub * 8
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -272,7 +294,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 4:
-                # Stage 4 (stride=16): tmp_a → tmp_b
+                # Stage 4 (stride 16): tmp_a → tmp_b
                 sub = (offs // 16) % 2
                 base = offs - sub * 16
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -284,7 +306,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 5:
-                # Stage 5 (stride=32): tmp_b → tmp_a
+                # Stage 5 (stride 32): tmp_b → tmp_a
                 sub = (offs // 32) % 2
                 base = offs - sub * 32
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -296,7 +318,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 6:
-                # Stage 6 (stride=64): tmp_a → tmp_b
+                # Stage 6 (stride 64): tmp_a → tmp_b
                 sub = (offs // 64) % 2
                 base = offs - sub * 64
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -308,7 +330,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 7:
-                # Stage 7 (stride=128): tmp_b → tmp_a
+                # Stage 7 (stride 128): tmp_b → tmp_a
                 sub = (offs // 128) % 2
                 base = offs - sub * 128
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -320,7 +342,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 8:
-                # Stage 8 (stride=256): tmp_a → tmp_b
+                # Stage 8 (stride 256): tmp_a → tmp_b
                 sub = (offs // 256) % 2
                 base = offs - sub * 256
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -332,7 +354,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 9:
-                # Stage 9 (stride=512): tmp_b → tmp_a
+                # Stage 9 (stride 512): tmp_b → tmp_a
                 sub = (offs // 512) % 2
                 base = offs - sub * 512
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -344,7 +366,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 10:
-                # Stage 10 (stride=1024): tmp_a → tmp_b
+                # Stage 10 (stride 1024): tmp_a → tmp_b
                 sub = (offs // 1024) % 2
                 base = offs - sub * 1024
                 a = tl.load(tmp_a_row + base, mask=mask, other=0.0)
@@ -356,7 +378,7 @@ if _HAS_TRITON:
                 tl.debug_barrier()
 
             if NUM_STAGES > 11:
-                # Stage 11 (stride=2048): tmp_b → tmp_a
+                # Stage 11 (stride 2048): tmp_b → tmp_a
                 sub = (offs // 2048) % 2
                 base = offs - sub * 2048
                 a = tl.load(tmp_b_row + base, mask=mask, other=0.0)
@@ -367,35 +389,43 @@ if _HAS_TRITON:
                 tl.store(tmp_a_row + offs, result, mask=mask)
                 tl.debug_barrier()
 
-            # Final result is in tmp_a if NUM_STAGES is even, tmp_b if odd
+            # Result resides in tmp_a when NUM_STAGES is even, tmp_b when odd.
             if NUM_STAGES % 2 == 0:
                 final = tl.load(tmp_a_row + offs, mask=mask, other=0.0)
             else:
                 final = tl.load(tmp_b_row + offs, mask=mask, other=0.0)
 
-            # Store to output using global index
+            # Write result back to global output at the original column indices.
             tl.store(out_base + cols, final, mask=mask)
 
 
 # ── Helper functions ────────────────────────────────────────────────────────
 
 def _is_power_of_two(n: int) -> bool:
+    """Return ``True`` if *n* is a power of 2."""
     return n > 0 and (n & (n - 1)) == 0
 
 
 def _is_power_of_four(n: int) -> bool:
+    """Return ``True`` if *n* is a power of 4 (4, 16, 64, 256, …)."""
     if n < 4:
         return False
-    return (n & (n - 1)) == 0 and (n & 0x55555555) == n
+    return (n & (n - 1)) == 0 and (n & _POWER_OF_FOUR_BITMASK) == n
 
 
 # ── Reference implementation (CPU fallback) ────────────────────────────────
+
+# Duplicated from calibration.py — see module docstring.
 
 _HADAMARD_CACHE: dict = {}
 
 
 def _get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
-    """Return a normalized Hadamard matrix (Regular for power-of-4, Sylvester otherwise)."""
+    """Return a normalised Hadamard matrix (Regular for power-of-4, Sylvester otherwise).
+
+    Reference implementation, duplicated from ``calibration.get_hadamard``
+    to keep this module free of ``comfy.*`` dependencies.
+    """
     key = (size, str(dtype), device)
     if key in _HADAMARD_CACHE:
         return _HADAMARD_CACHE[key]
@@ -424,7 +454,11 @@ def _get_hadamard(size: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
 
 
 def _rotate_activations_cpu(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """CPU fallback: group-wise Hadamard rotation via dense matmul."""
+    """CPU fallback: group-wise Hadamard rotation via dense matrix multiplication.
+
+    Must remain bit-identical to ``calibration.rotate_activations`` to serve
+    as the correctness reference for the Triton kernel tests.
+    """
     orig_features = x.shape[-1]
     if orig_features % rot_size != 0:
         pad = rot_size - (orig_features % rot_size)
@@ -441,7 +475,7 @@ def _rotate_activations_cpu(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 # ── Triton dispatchers ─────────────────────────────────────────────────────
 
 def _fht_rotate_cuda_regular(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Triton FHT for power-of-4 rot_sizes. Returns padded tensor; caller crops."""
+    """Dispatch the Regular (power-of-4) FHT kernel on CUDA.  Returns the padded tensor; the caller is responsible for cropping."""
     orig_features = x.shape[-1]
     if orig_features % rot_size != 0:
         pad = rot_size - (orig_features % rot_size)
@@ -454,11 +488,11 @@ def _fht_rotate_cuda_regular(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     x_contig = x if x.is_contiguous() else x.contiguous()
     num_stages = int(math.log(rot_size) / math.log(4))
     num_chunks = K // rot_size
-    block_k = rot_size  # must be power of 2
+    block_k = rot_size  # guaranteed to be a power of 2
 
     out = torch.empty(M, K, dtype=torch.float32, device=x.device)
 
-    # Allocate tmp buffers for one row chunk (reused across all row chunks)
+    # Scratch buffers sized for one chunk, reused across all row chunks.
     chunk = min(_CHUNK_ROWS, M)
     tmp_a = torch.empty(chunk, block_k, dtype=torch.float32, device=x.device)
     tmp_b = torch.empty(chunk, block_k, dtype=torch.float32, device=x.device)
@@ -484,7 +518,7 @@ def _fht_rotate_cuda_regular(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 
 
 def _fht_rotate_cuda_sylvester(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Triton FHT for any power-of-2 rot_size. Returns padded tensor; caller crops."""
+    """Dispatch the Sylvester (any power-of-2) FHT kernel on CUDA.  Returns the padded tensor; the caller is responsible for cropping."""
     orig_features = x.shape[-1]
     if orig_features % rot_size != 0:
         pad = rot_size - (orig_features % rot_size)
@@ -497,10 +531,11 @@ def _fht_rotate_cuda_sylvester(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     x_contig = x if x.is_contiguous() else x.contiguous()
     num_stages = int(math.log(rot_size) / math.log(2))
     num_chunks = K // rot_size
-    block_k = rot_size  # must be power of 2
+    block_k = rot_size  # guaranteed to be a power of 2
 
     out = torch.empty(M, K, dtype=torch.float32, device=x.device)
 
+    # Scratch buffers sized for one chunk, reused across all row chunks.
     chunk = min(_CHUNK_ROWS, M)
     tmp_a = torch.empty(chunk, block_k, dtype=torch.float32, device=x.device)
     tmp_b = torch.empty(chunk, block_k, dtype=torch.float32, device=x.device)
@@ -527,24 +562,34 @@ def _fht_rotate_cuda_sylvester(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def fht_rotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Apply group-wise Hadamard rotation using O(N log N) FHT.
+# Maximum ``rot_size`` supported by the Triton kernels.  Both kernels are
+# compiled with a fixed number of butterfly stages (6 for Regular → 4⁶ =
+# 4096; 12 for Sylvester → 2¹² = 4096).  Sizes beyond this threshold
+# silently fall back to the CPU dense-matmul path.
+_MAX_TRITON_ROT_SIZE = 4096
 
-    Drop-in for ``rotate_activations(x, rot_size)``.  Selects Regular vs
-    Sylvester kernel based on ``rot_size``, with automatic CPU fallback.
+
+def fht_rotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
+    """Apply group-wise Hadamard rotation using O(N log N) Fast Hadamard Transform.
+
+    Drop-in replacement for ``rotate_activations(x, rot_size)``.  Selects
+    the Regular (power-of-4) or Sylvester (any power-of-2) kernel based on
+    ``rot_size``.  Falls back to CPU dense matrix multiplication when CUDA
+    or Triton is unavailable, or when ``rot_size`` exceeds the hardcoded
+    kernel stage limit (4096).
     """
     if not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
 
-    # CPU fallback: use dense matmul
-    if not x.is_cuda or not _HAS_TRITON:
+    # Fall back to CPU dense matmul when CUDA/Triton is unavailable or
+    # rot_size exceeds the kernel stage limit.
+    if not x.is_cuda or not _HAS_TRITON or rot_size > _MAX_TRITON_ROT_SIZE:
         return _rotate_activations_cpu(x, rot_size)
 
-    # CUDA path: select Regular vs Sylvester kernel
+    # CUDA path: select Regular vs Sylvester kernel.
     orig_shape = x.shape
     orig_dtype = x.dtype
 
-    # Flatten to 2D for the kernel
     x_flat = x.reshape(-1, x.shape[-1]).float()
 
     if _is_power_of_four(rot_size):
@@ -552,8 +597,8 @@ def fht_rotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     else:
         out_flat = _fht_rotate_cuda_sylvester(x_flat, rot_size)
 
-    # Reshape to original leading dims, with padded feature dim.
-    # The kernel pads K to a multiple of rot_size internally, so
-    # out_flat.shape[-1] may differ from orig_shape[-1].
+    # Restore original leading dimensions.  The output feature dimension
+    # may be larger than the input because the kernel pads to a multiple of
+    # rot_size; the caller is responsible for cropping.
     out_shape = (*orig_shape[:-1], out_flat.shape[-1])
     return out_flat.reshape(out_shape).to(orig_dtype)

@@ -1,6 +1,7 @@
 """Tests for ActivationStatsCollector and calibration helpers."""
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -217,30 +218,18 @@ def test_build_sigmas_returns_simple_schedule(calibration_mod):
 
 
 def test_collect_stats_validates_inputs(calibration_mod):
-    try:
+    with pytest.raises(ValueError, match="model_patcher is required"):
         calibration_mod.collect_stats(None, conditioning=[[{}]], num_steps=1, num_samples=1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for None model")
 
     class FakePatcher:
         model = None
         load_device = torch.device("cpu")
 
-    try:
+    with pytest.raises(ValueError, match="conditioning"):
         calibration_mod.collect_stats(FakePatcher(), conditioning=[], num_steps=1, num_samples=1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for empty conditioning")
 
-    try:
+    with pytest.raises(ValueError, match="num_steps"):
         calibration_mod.collect_stats(FakePatcher(), conditioning=[[{}]], num_steps=0, num_samples=1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for num_steps=0")
 
 
 def test_block_gram_last_block_has_actual_size(calibration_mod):
@@ -1234,21 +1223,13 @@ class TestSigmaClipping:
 
     def test_min_greater_than_max_raises(self, calibration_mod):
         """sigma_min > sigma_max must raise ValueError."""
-        try:
+        with pytest.raises(ValueError, match="sigma_min"):
             calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.9, sigma_max=0.1)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected ValueError for sigma_min > sigma_max")
 
     def test_min_equals_max_raises(self, calibration_mod):
         """sigma_min == sigma_max must raise ValueError (no steps possible)."""
-        try:
+        with pytest.raises(ValueError, match="sigma_min"):
             calibration_mod._build_sigmas(None, num_steps=4, sigma_min=0.5, sigma_max=0.5)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected ValueError for sigma_min == sigma_max")
 
     def test_at_least_two_sigmas(self, calibration_mod):
         """Degenerate clipping must still produce ≥2 sigmas."""
